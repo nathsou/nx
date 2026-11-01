@@ -93,8 +93,9 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
 
 ### iPhone and iPad
 
-`make ios GAME=dread` builds an iOS / iPadOS app with that game in it, for the Simulator so far: touch-friendly menu,
-controllers, and Apple's on-screen controller for playing by touch. See [docs/ios.md](docs/ios.md).
+`make ios IOS_GAMES="dread acnh"` builds an iOS / iPadOS app holding both games, with a game selection screen, a
+touch-friendly menu, controllers (Home opens the menu) and Apple's on-screen controller for playing by touch. It runs
+on an iPhone signed with a free Apple account. See [docs/ios.md](docs/ios.md).
 
 ## Settings and the menu
 

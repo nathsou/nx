@@ -16,6 +16,7 @@
 
 static const GameLibTables *g_tables;
 static char g_error[256];
+static char g_tables_dir[1100];  // (the game_dir g_tables is for)
 
 // The library's id file (<library>.id, written next to it by the build): its id (gamelib_full_id), read without
 // loading it.
@@ -59,6 +60,17 @@ static int candidates(const char *game_dir, char out[MAX_CANDIDATES][1100]) {
             if (exists(out[n])) n++;
         }
         if (d) closedir(d);
+#ifdef __APPLE__  // (the iOS app: Frameworks/<game>/game.dylib, one per game it holds)
+        char fw[1100];
+        snprintf(fw, sizeof fw, "%s/Frameworks", exe);
+        d = opendir(fw);
+        for (struct dirent *e; d && (e = readdir(d)) && n < MAX_CANDIDATES - 1;) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(out[n], 1100, "%s/%s/%s", fw, e->d_name, GAMELIB_NAME);
+            if (exists(out[n])) n++;
+        }
+        if (d) closedir(d);
+#endif
 #endif
     }
     if (game_dir && n < MAX_CANDIDATES) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
@@ -66,7 +78,7 @@ static int candidates(const char *game_dir, char out[MAX_CANDIDATES][1100]) {
 }
 
 bool gamelib_present(const char *game_dir) {
-    if (g_tables) return true;
+    if (g_tables && game_dir && !strcmp(game_dir, g_tables_dir)) return true;
     char want[GAMELIB_FULL_ID_SIZE];
     if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
     char c[MAX_CANDIDATES][1100];
@@ -97,8 +109,11 @@ static const GameLibTables *open_lib(const char *path, const char *want) {
 
 bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     static bool tried;
+    if (tried && game_dir && strcmp(game_dir, g_tables_dir)) tried = false, g_tables = NULL;  // (another game: its own
+                                                                                               //  library; the old stays loaded)
     if (!tried) {
         tried = true;
+        snprintf(g_tables_dir, sizeof g_tables_dir, "%s", game_dir ? game_dir : "");
         snprintf(g_error, sizeof g_error, "the game code for these game files hasn't been built (make gen GAME=<name> && make GAME=<name>)");
         char want[GAMELIB_FULL_ID_SIZE] = "";
         if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) {

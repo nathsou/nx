@@ -1,11 +1,13 @@
-// In-game menu (Dear ImGui over the game image): F1 or Esc, or Minus + Plus together on a controller. The game pauses
+// In-game menu (Dear ImGui over the game image): F1 or Esc, Home or Minus + Plus together on a controller. The game pauses
 // under it (Game tab: its frame loop waits in nvnQueuePresentTexture, runtime/nvn/objects.c, the window showing its
 // last frame) and its sound is muted. Tabs: the game (resume, restart, quit), saves (backups under save/<game>/backups,
 // restored by restarting the game), the game's date and time, video, audio, controls. Settings go to nx.ini at once.
 // The menu is built and drawn on the render thread (menu_render, after the game image), input reaches it from the
 // window's event loop on the main thread (menu_handle_event): one lock between the two.
 // iOS / iPadOS (MENU_TOUCH): the menu button at the top of the screen opens it; a tap presses, a drag up or down
-// scrolls, a drag sideways moves a slider; sized in points for fingers, inside the screen's safe area.
+// scrolls, a drag sideways moves a slider; sized in points for fingers, inside the screen's safe area. The button shows
+// while the screen is touched (and a few seconds after). With several games in the app, a selection screen comes
+// first (menu_pick_game) and the Game tab can go back to it.
 #include "menu.h"
 
 #if defined(__APPLE__)
@@ -19,6 +21,7 @@
 #endif
 #define HAVE_METALFX (!TARGET_OS_SIMULATOR)  // (the iOS Simulator has no MetalFX: renderer bilinear / optical flow)
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
 
 #include <sys/stat.h>
@@ -57,7 +60,7 @@ void time_offset_changed(void);
 void renderer_frame_counts(uint64_t *game, uint64_t *shown);  // runtime/nvn/metal.m
 const char *menu_game_name(void);      // runtime/game.c
 }
-enum { REBOOT_GAME = 1 };  // (rt.h RT_REBOOT_GAME)
+enum { REBOOT_GAME = 1, REBOOT_TITLE = 2 };  // (rt.h RT_REBOOT_*: TITLE - the game selection screen on iOS)
 
 static std::atomic<bool> g_want_fullscreen_apply{true};
 static std::atomic<bool> g_open{false};
@@ -76,7 +79,23 @@ static std::atomic<float> g_button_gap{0};              //  the on-screen contro
 static std::atomic<bool> g_pad_buttons{false};
 static std::atomic<float> g_font_px{17};
 static struct { SDL_FingerID id; bool down, pressed, scrolling; float x0, y0, x, y; } g_touch;
+// (main -> render thread) the menu button: shown while a finger is on the screen and BUTTON_SHOW seconds after
+#define BUTTON_SHOW 5.0
+#define BUTTON_FADE 0.4
+static std::atomic<int> g_fingers{0};
+static std::atomic<double> g_last_touch{-100};
+static double button_visibility(void) {  // 1 shown, 0 hidden, between: fading out
+    if (g_fingers > 0) return 1;
+    double t = CACurrentMediaTime() - g_last_touch;
+    return t < BUTTON_SHOW ? 1 : t > BUTTON_SHOW + BUTTON_FADE ? 0 : 1 - (t - BUTTON_SHOW) / BUTTON_FADE;
+}
+extern "C" int g_game_count;  // runtime/main.c: games in the app's Documents
 #endif
+// The game selection screen (menu_pick_game, main thread): its games, and the one picked
+static bool g_picking;
+static int g_pick_n, g_picked = -1;
+static const char *const *g_pick_titles, *const *g_pick_details;
+static const bool *g_pick_playable;
 
 extern "C" {
 
@@ -173,14 +192,18 @@ extern "C" bool menu_handle_event(const SDL_Event *e) {
         g_want_fullscreen_apply = true;
         return true;
     }
-    bool open = g_open;
-    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat &&
+    bool open = g_open || g_picking;
+    if (!g_picking && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat &&
         (e->key.key == SDLK_F1 || (e->key.key == SDLK_ESCAPE && !(open && (g_popup || g_text_input))))) {
         set_open(!open);
         return true;
     }
-    if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e->type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+    if (!g_picking && (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e->type == SDL_EVENT_GAMEPAD_BUTTON_UP)) {
         bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+        if (e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {  // Home (a Switch Pro controller's, an Xbox / PlayStation logo)
+            if (down && !g_popup) set_open(!open);
+            return true;
+        }
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) g_pad_back = down;
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) g_pad_start = down;
         if (down && g_pad_back && g_pad_start) { set_open(!open); return true; }
@@ -196,10 +219,14 @@ extern "C" bool menu_handle_event(const SDL_Event *e) {
             fprintf(stderr, "[menu] finger %#x %llx at %.0f,%.0f (window %dx%d, button %.0f,%.0f-%.0f,%.0f)\n", e->type,
                     (unsigned long long)e->tfinger.fingerID, x, y, g_win_w, g_win_h, (float)g_button[0], (float)g_button[1],
                     (float)g_button[2], (float)g_button[3]);
+        bool shown = button_visibility() > 0.5;  // (before this touch: a touch on a hidden button only shows it)
+        if (e->type == SDL_EVENT_FINGER_DOWN) g_fingers++;
+        if ((e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) && g_fingers > 0) g_fingers--;
+        g_last_touch = CACurrentMediaTime();
         if (!open) {  // (the game takes no touches: only the menu button's, and Minus / Plus beside it)
             float pad = g_font_px * 0.5f, w = g_button[2] - g_button[0], step = w + g_button_gap;
             if (e->type != SDL_EVENT_FINGER_DOWN || y < g_button[1] - pad || y > g_button[3] + pad) return true;
-            if (x >= g_button[0] - pad && x <= g_button[2] + pad) set_open(true);
+            if (x >= g_button[0] - pad && x <= g_button[2] + pad) { if (shown) set_open(true); }
             else if (g_pad_buttons && x >= g_button[0] - step - pad && x < g_button[0] - pad) input_touch_tap(false);
             else if (g_pad_buttons && x > g_button[2] + pad && x <= g_button[2] + step + pad) input_touch_tap(true);
             return true;
@@ -299,7 +326,7 @@ extern "C" void menu_apply_window_requests(void *win) {
     float d = SDL_GetWindowPixelDensity(w);
     if (d > 0) g_density = d;
 #if MENU_TOUCH
-    touch_pad_update(g_open);
+    touch_pad_update(g_open || g_picking);
     g_pad_buttons = touch_pad_shown();
     SDL_GetWindowSizeInPixels(w, &g_win_w, &g_win_h);
     SDL_Rect sa;
@@ -507,6 +534,16 @@ static void tab_game(void) {
     ImGui::SameLine();
     if (ImGui::Button("Quit")) ImGui::OpenPopup("Quit?");
 #endif
+#if MENU_TOUCH
+    if (g_game_count > 1) {
+        ImGui::SameLine();
+        if (ImGui::Button("Switch game")) ImGui::OpenPopup("Switch game?");
+    }
+    if (confirm("Switch game?", "Go back to the game selection? Progress since the game last saved is lost.", "Switch game")) {
+        set_open(false);
+        rt_request_reboot(REBOOT_TITLE);
+    }
+#endif
     if (confirm("Restart?", "Restart the game? Progress since the game last saved is lost.", "Restart")) {
         set_open(false);
         rt_request_reboot(REBOOT_GAME);
@@ -520,10 +557,10 @@ static void tab_game(void) {
     ImGui::SeparatorText("Menu");
     if (ImGui::Checkbox("Pause the game while this menu is open", &g_settings.menu_pause)) settings_save();
 #if MENU_TOUCH
-    help("Open this menu with the button at the top of the screen, or Minus and Plus together on a controller "
-         "(F1 or Esc on a keyboard).");
+    help("Open this menu with the button at the top of the screen (touch the screen to show it), or Home - or Minus "
+         "and Plus together - on a controller (F1 or Esc on a keyboard).");
 #else
-    help("Open and close this menu with F1 or Esc, or Minus and Plus together on a controller.");
+    help("Open and close this menu with F1 or Esc, or Home - or Minus and Plus together - on a controller.");
 #endif
 }
 
@@ -831,6 +868,105 @@ static void draw_menu(void) {
     ImGui::End();
 }
 
+// The game selection screen: a card for each game (one without its game code in the app can't be picked)
+static void draw_picker(void) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImVec2 pos = vp->Pos, size = vp->Size;
+#if MENU_TOUCH
+    if (g_safe[2] > 0) pos = ImVec2(g_safe[0], g_safe[1]), size = ImVec2(g_safe[2], g_safe[3]);
+#endif
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    ImGui::Begin("##games", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    float fs = ImGui::GetFontSize(), cw = fminf(size.x * 0.8f, fs * 30), ch = fs * 4.2f;
+    float total = fs * 4 + g_pick_n * (ch + fs);
+    ImGui::SetCursorPosY(fmaxf(fs, (size.y - total) * 0.5f));
+    ImGui::SetWindowFontScale(1.6f);
+    float tw = ImGui::CalcTextSize("Choose a game").x;
+    ImGui::SetCursorPosX((size.x - tw) * 0.5f);
+    ImGui::TextUnformatted("Choose a game");
+    ImGui::SetWindowFontScale(1);
+    ImGui::Dummy(ImVec2(0, fs));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, fs * 0.6f);
+    bool focused = false;
+    for (int i = 0; i < g_pick_n; i++) {
+        ImGui::PushID(i);
+        ImGui::SetCursorPosX((size.x - cw) * 0.5f);
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::BeginDisabled(!g_pick_playable[i]);
+        if (ImGui::Button("##game", ImVec2(cw, ch))) g_picked = i;
+        if (g_pick_playable[i] && !focused) { ImGui::SetItemDefaultFocus(); focused = true; }
+        ImGui::EndDisabled();
+        ImDrawList *dl = ImGui::GetWindowDrawList();  // (the title over the version: two sizes on one button)
+        ImU32 text = ImGui::GetColorU32(g_pick_playable[i] ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+        ImFont *font = ImGui::GetFont();
+        dl->AddText(font, fs * 1.3f, ImVec2(at.x + fs * 1.2f, at.y + ch * 0.5f - fs * 1.35f), text, g_pick_titles[i]);
+        dl->AddText(font, fs, ImVec2(at.x + fs * 1.2f, at.y + ch * 0.5f + fs * 0.2f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                    g_pick_details[i]);
+        ImGui::Dummy(ImVec2(0, fs * 0.4f));
+        ImGui::PopID();
+    }
+    ImGui::PopStyleVar();
+    ImGui::End();
+}
+
+extern "C" void *ui_metal_layer(void);
+extern "C" void *ui_metal_device(void);
+extern "C" SDL_Window *ui_window(void);
+extern "C" void input_handle_event(const SDL_Event *e);
+
+// (main thread, before a game boots: no game draws) the selection screen until a game is picked; its index
+extern "C" int menu_pick_game(int n, const char *const titles[], const char *const details[], const bool playable[]) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
+    SDL_Window *w = ui_window();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    g_pick_n = n, g_pick_titles = titles, g_pick_details = details, g_pick_playable = playable, g_picked = -1;
+    g_picking = true;
+    const char *auto_pick = getenv("LARECOMP_PICK_GAME");  // (tests) that game's index, after that many frames: "1@120"
+    int auto_k = -1, auto_at = 0, frame = 0;
+    if (auto_pick) sscanf(auto_pick, "%d@%d", &auto_k, &auto_at);
+    while (g_picked < 0) {
+        @autoreleasepool {
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_EVENT_QUIT) exit(0);
+                if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) input_handle_event(&e);
+                menu_handle_event(&e);
+            }
+            menu_apply_window_requests(w);
+            int pw, ph;
+            SDL_GetWindowSizeInPixels(w, &pw, &ph);
+            layer.drawableSize = CGSizeMake(pw, ph);
+            id<CAMetalDrawable> d = [layer nextDrawable];
+            if (!d) continue;
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = d.texture;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0.035, 0.04, 0.05, 1);
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            menu_render(dev, cb, d.texture);
+            [cb presentDrawable:d];
+            [cb commit];
+            if (auto_k >= 0 && auto_k < n && ++frame >= auto_at) g_picked = auto_k;
+        }
+    }
+    g_picking = false;
+    {   // (the game starts with nothing held or hovered from the screen)
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        ImGuiIO &io = ImGui::GetIO();
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        io.ClearInputKeys();
+    }
+    return g_picked;
+}
+
 #if MENU_TOUCH
 // The menu button, at the top of the screen in the middle (clear of a game's corners), faint over the game
 static void draw_menu_button(float width) {
@@ -840,9 +976,12 @@ static void draw_menu_button(float width) {
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     ImU32 bg = IM_COL32(20, 22, 26, 90), fg = IM_COL32(235, 240, 245, 150);
     float lw = w * 0.42f, t = fmaxf(1.5f * g_density, 1), cx = (a.x + b.x) * 0.5f, cy = (a.y + b.y) * 0.5f;
-    dl->AddRectFilled(a, b, bg, h * 0.5f);
-    for (int i = -1; i <= 1; i++)
-        dl->AddLine(ImVec2(cx - lw * 0.5f, cy + i * h * 0.2f), ImVec2(cx + lw * 0.5f, cy + i * h * 0.2f), fg, t);
+    if (double v = button_visibility(); v > 0) {  // (the menu's: only while the screen is touched)
+        dl->AddRectFilled(a, b, IM_COL32(20, 22, 26, (int)(90 * v)), h * 0.5f);
+        for (int i = -1; i <= 1; i++)
+            dl->AddLine(ImVec2(cx - lw * 0.5f, cy + i * h * 0.2f), ImVec2(cx + lw * 0.5f, cy + i * h * 0.2f),
+                        IM_COL32(235, 240, 245, (int)(150 * v)), t);
+    }
     if (!g_pad_buttons) return;
     for (int side = -1; side <= 1; side += 2) {  // Minus, Plus (the on-screen controller has neither)
         float x = cx + side * (w + gap);
@@ -871,7 +1010,7 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
             set_open(false);
     }
     bool open = g_open, fps = g_settings.show_fps;
-    if (!open && !fps && !MENU_TOUCH) return;
+    if (!open && !fps && !MENU_TOUCH && !g_picking) return;
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     ensure_context();
     ImGuiIO &io = ImGui::GetIO();
@@ -905,10 +1044,11 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
     ImGui_ImplMetal_NewFrame(rp);
     ImGui::NewFrame();
     g_popup = false;
-    if (open) draw_menu();
-    if (fps) draw_fps();
+    if (g_picking) draw_picker();
+    else if (open) draw_menu();
+    if (fps && !g_picking) draw_fps();
 #if MENU_TOUCH
-    if (!open) draw_menu_button(target.width);
+    if (!open && !g_picking) draw_menu_button(target.width);
 #endif
     g_text_input = io.WantTextInput;
     ImGui::Render();

@@ -13,7 +13,7 @@ S=$PWD/build/deps-src
 mkdir -p "$S" "$P/lib" "$P/include"
 SYSROOT=$(xcrun --sdk "$SDK" --show-sdk-path)
 CC=$(xcrun --sdk "$SDK" --find clang)
-TARGET=arm64-apple-ios$MIN$([ "$SDK" = iphonesimulator ] && echo -simulator)
+TARGET=arm64-apple-ios$MIN$([ "$SDK" = iphonesimulator ] && echo -simulator || true)
 JOBS=$(sysctl -n hw.ncpu)
 
 fetch() {  # url sha256 file

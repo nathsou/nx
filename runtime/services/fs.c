@@ -112,9 +112,9 @@ static void base_close(void) {
 static void base_open(void) {
     if (g_base_open) return;
     char path[1100], why[256] = "";
-    snprintf(path, sizeof path, "%s/system", g_romfs_dir);  // (a folder every Dread romfs has)
-    struct stat sb;
-    if (stat(path, &sb) == 0 && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
+    struct stat sb;  // (the romfs as a folder of files; not a folder of Dread's own in it: ACNH's are "System", "Model"...,
+                     //  and iOS's file system tells the cases apart)
+    if (stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode) && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
         LOG("[fs] romfs: %d files served from %s\n", g_base.nfiles, g_romfs_dir);
     } else {
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // (an older version's image)

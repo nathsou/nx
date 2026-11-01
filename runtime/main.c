@@ -167,7 +167,8 @@ static void boot(const char *root) {
     snprintf(exefs, sizeof exefs, "%s/exefs", root);
     snprintf(romfs, sizeof romfs, "%s/romfs", root);
     snprintf(npdm_path, sizeof npdm_path, "%s/main.npdm", exefs);
-    if (!g_romfs_dir) g_romfs_dir = strdup(romfs);
+    free((void *)g_romfs_dir);  // (the game may be another one: the selection screen)
+    g_romfs_dir = strdup(romfs);
 
 #ifdef __linux__
     {   // the window and graphics device first (normally made by the start screen or ui_run), so the guest heap can be
@@ -241,6 +242,52 @@ static void log_startup_info(void) {
             si.cpu[0] ? si.cpu : "unknown CPU", cores, ram, si.package ? ", " : "", si.package ? si.package : "");
 }
 
+#if TARGET_OS_IPHONE
+// The games in the data folder (the app's Documents): its folders with exefs/main in them, by name
+int g_game_count;  // (runtime/ui/menu.mm: "Switch game" with more than one)
+static char g_games[16][1024];
+static int cmp_str(const void *a, const void *b) { return strcmp(a, b); }
+static void find_games(void) {
+    g_game_count = 0;
+    DIR *d = opendir(".");
+    struct stat st;
+    char p[1100];
+    for (struct dirent *e; d && (e = readdir(d)) && g_game_count < 16;) {
+        snprintf(p, sizeof p, "%s/exefs/main", e->d_name);
+        if (e->d_name[0] != '.' && stat(p, &st) == 0 && realpath(e->d_name, g_games[g_game_count])) g_game_count++;
+    }
+    if (d) closedir(d);
+    qsort(g_games, g_game_count, sizeof g_games[0], cmp_str);
+}
+// The game to play: the only one, or the player's pick on the selection screen (runtime/ui/menu.mm)
+static const char *pick_game(void) {
+    if (!g_game_count)
+        FATAL("No game files found. Put the game's folder (with exefs/ and romfs/ in it) in nx's folder in the "
+              "Files app (On My iPhone / iPad > nx), then start nx again.\n");
+    if (g_game_count == 1) return g_games[0];
+    static char titles[16][160], details[16][200];
+    const char *t[16], *dt[16];
+    bool playable[16];
+    for (int i = 0; i < g_game_count; i++) {
+        GameInfo g;
+        char why[256];
+        const char *folder = strrchr(g_games[i], '/') ? strrchr(g_games[i], '/') + 1 : g_games[i];
+        playable[i] = game_identify(g_games[i], &g, why, sizeof why) && gamelib_present(g_games[i]);
+        snprintf(titles[i], sizeof titles[i], "%s", g.name[0] ? g.name : folder);
+        if (!playable[i]) snprintf(details[i], sizeof details[i], "%s - this app doesn't have its game code", folder);
+        else snprintf(details[i], sizeof details[i], "%s%s%s", g.version ? "Version " : "", g.version ? g.version->label : "",
+                      g.version ? "" : folder);
+        t[i] = titles[i], dt[i] = details[i];
+    }
+    extern void ui_window_init(void);
+    extern int menu_pick_game(int n, const char *const titles[], const char *const details[], const bool playable[]);
+    ui_window_init();
+    int k = menu_pick_game(g_game_count, t, dt, playable);
+    LOG("[boot] game picked: %s\n", g_games[k]);
+    return g_games[k];
+}
+#endif
+
 int main(int argc, char **argv) {
     plat_init();
     log_startup_info();
@@ -264,23 +311,18 @@ int main(int argc, char **argv) {
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
 #if TARGET_OS_IPHONE
     // the game files: a folder in the data folder (the app's Documents) with exefs/main in it, unless given
-    if (!strcmp(root, ".")) {
-        DIR *d = opendir(".");
-        struct stat st;
-        char p[1100];
-        for (struct dirent *e; d && (e = readdir(d));) {
-            snprintf(p, sizeof p, "%s/exefs/main", e->d_name);
-            if (e->d_name[0] != '.' && stat(p, &st) == 0 && realpath(e->d_name, arg_root)) { root = arg_root; break; }
-        }
-        if (d) closedir(d);
-        if (!strcmp(root, "."))
-            FATAL("No game files found. Put the game's folder (with exefs/ and romfs/ in it) in nx's folder in the "
-                  "Files app (On My iPhone / iPad > nx), then start nx again.\n");
-    }
+    bool given = strcmp(root, ".") != 0;
+    find_games();
+    if (!given) root = pick_game();
 #endif
-    for (;;) {  // (an in-place reboot boots again; "back to the start screen" too, as there is none yet)
+    for (;;) {  // (an in-place reboot boots again; "back to the start screen": the game selection screen on iOS)
         boot(root);
-        ui_run();  // window and input on the main thread; returns when a reboot is requested
+        int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
+#if TARGET_OS_IPHONE
+        if (kind == RT_REBOOT_TITLE && !given) { find_games(); root = pick_game(); }
+#else
+        (void)kind;
+#endif
     }
 }

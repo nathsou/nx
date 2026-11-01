@@ -296,16 +296,40 @@ corpus: build/shader_corpus $(EXE)
 	LARECOMP_SHADER_PREP_ONLY=1 LARECOMP_NO_LAUNCHER=1 LARECOMP_NO_AUDIO=1 $(EXE) $(GAME_DIR) && exit $$rc
 .PHONY: corpus
 
-# ---- iOS / iPadOS (docs/ios.md): `make ios GAME=<name>` builds build/<sdk>/nx.app with that game's code in it
-# (Frameworks/game.dylib); `make ios-run` installs it in the booted Simulator and starts it there.
-ios:
+# ---- iOS / iPadOS (docs/ios.md): `make ios IOS_GAMES="dread acnh"` builds build/<sdk>/nx.app with those games' code
+# in it (Frameworks/<game>/game.dylib; default: GAME), which shows a game selection screen when it has several.
+# `make ios-run` installs it in the booted Simulator and starts it there; `make ios-device IOS_DEVICE=<id>` on a device.
+IOS_GAMES ?= $(GAME)
+ios-libs:
+	@for g in $(IOS_GAMES); do $(MAKE) PLATFORM=ios GAME=$$g gamelib || exit 1; done
+ios: ios-libs
 	$(MAKE) PLATFORM=ios ios-app
-ios-run:
+ios-run: ios-libs
 	$(MAKE) PLATFORM=ios ios-install
+ios-device: ios-libs
+	$(MAKE) PLATFORM=ios IOS_SDK=iphoneos ios-device-install
+gamelib: $(EXE) $(GAMELIB)
 ifeq ($(PLATFORM),ios)
-ios-app: $(EXE) $(APP)/Info.plist $(APP)/DejaVuSans.ttf $(if $(GEN_SRC),$(APP)/Frameworks/game.dylib)
-	codesign -f -s - $(if $(GEN_SRC),$(APP)/Frameworks/game.dylib) $(APP) 2>&1 | grep -v "replacing existing signature" || true
+IOS_LIBS := $(foreach g,$(IOS_GAMES),$(APP)/Frameworks/$(g)/game.dylib)
+# A device (IOS_SDK=iphoneos): IOS_PROFILE=<.mobileprovision for dev.dreadrecomp.nx> (Xcode makes one: docs/ios.md),
+# IOS_SIGN=<signing identity, default the first "Apple Development" one>; signed with the profile's entitlements.
+IOS_SIGN ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Apple Development" | awk '{print $$2}')
+ios-app: $(EXE) $(APP)/Info.plist $(APP)/DejaVuSans.ttf $(IOS_LIBS)
+	@for f in $(APP)/Frameworks/*/game.dylib; do case " $(IOS_LIBS) " in *" $$f "*) ;; *) echo "removing $$f"; rm -rf "$$(dirname $$f)";; esac; done
+ifeq ($(IOS_SDK),iphoneos)
+	@[ -n "$(IOS_PROFILE)" ] || { echo "IOS_PROFILE=<provisioning profile> needed to sign for a device (docs/ios.md)"; exit 1; }
+	cp "$(IOS_PROFILE)" $(APP)/embedded.mobileprovision
+	security cms -D -i "$(IOS_PROFILE)" > $(B)/profile.plist && plutil -extract Entitlements xml1 -o $(B)/nx.entitlements $(B)/profile.plist
+	codesign -f -s $(IOS_SIGN) $(IOS_LIBS)
+	codesign -f -s $(IOS_SIGN) --entitlements $(B)/nx.entitlements $(APP)
+else
+	codesign -f -s - $(IOS_LIBS) $(APP) 2>&1 | grep -v "replacing existing signature" || true
+endif
 	@echo "$(APP)"
+# (a device on USB: IOS_DEVICE=<its identifier from `xcrun devicectl list devices`>)
+ios-device-install: ios-app
+	xcrun devicectl device install app --device $(IOS_DEVICE) $(APP)
+	xcrun devicectl device process launch --device $(IOS_DEVICE) --console --terminate-existing dev.dreadrecomp.nx
 $(APP)/Info.plist: tools/ios/Info.plist Makefile
 	@mkdir -p $(dir $@)
 	sed -e 's/@PLATFORM@/$(if $(filter iphonesimulator,$(IOS_SDK)),iPhoneSimulator,iPhoneOS)/' -e 's/@IOS_MIN@/$(IOS_MIN)/' $< > $@
@@ -313,14 +337,14 @@ $(APP)/Info.plist: tools/ios/Info.plist Makefile
 $(APP)/DejaVuSans.ttf: third_party/fonts/DejaVu/DejaVuSans.ttf
 	@mkdir -p $(dir $@)
 	cp $< $@
-$(APP)/Frameworks/game.dylib: $(GAMELIB)
+$(APP)/Frameworks/%/game.dylib: $(B)/%/game.dylib
 	@mkdir -p $(dir $@)
 	cp $< $@ && cp $<.id $@.id
-# (the Simulator: the game files go in the app's Documents folder - a link to $(GAME_DIR), not a 4 GB copy)
+# (the Simulator: each game's files go in the app's Documents folder - a link to data/<game>, not a copy)
 ios-install: ios-app
 	xcrun simctl install booted $(APP)
 	@docs=$$(xcrun simctl get_app_container booted dev.dreadrecomp.nx data) && mkdir -p "$$docs/Documents" && \
-	    [ -e "$$docs/Documents/$(GAME)" ] || ln -s "$(abspath $(GAME_DIR))" "$$docs/Documents/$(GAME)"
+	    for g in $(IOS_GAMES); do [ -e "$$docs/Documents/$$g" ] || ln -s "$(abspath data)/$$g" "$$docs/Documents/$$g"; done
 	xcrun simctl launch --console-pty booted dev.dreadrecomp.nx
 endif
-.PHONY: ios ios-run ios-app ios-install
+.PHONY: ios ios-libs ios-run ios-device gamelib ios-app ios-install ios-device-install
