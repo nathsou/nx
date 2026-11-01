@@ -104,7 +104,12 @@ extern volatile int g_rt_unwind;   // set while guest threads are being stopped 
 void rt_unwind_point(void);        // guest threads: unwind to thread_main if a reboot is stopping them
 
 // ---- ui (runtime/nvn/metal.m)
-int ui_run(void);  // window loop; returns the reboot kind requested (the window stays open)
+int ui_run(void);
+// The game's clock (runtime/kernel.c): the host's at the game speed (menu: Video > Game speed)
+uint64_t rt_game_ns(void);
+double rt_speed(void);
+void rt_speed_set(double speed);
+void rt_speed_frame(void);  // (each frame: the setting applied)  // window loop; returns the reboot kind requested (the window stays open)
 
 // ---- helpers
 void guest_call(Cpu *c, uint64_t addr);   // call guest function at addr (saves/restores x30)

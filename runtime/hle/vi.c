@@ -14,12 +14,12 @@ uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
     (void)arg;
-    const uint64_t period = 16666667;
+    const uint64_t period = 16666667;  // (60 Hz of the game's clock: at the game speed in the host's)
     plat_thread_realtime(period);
     plat_thread_perf_core(PLAT_PERF_VSYNC);
     uint64_t next = plat_now_ns();
     for (;;) {
-        next += period;
+        next += (uint64_t)(period / rt_speed());
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();
         if (now > next + period * 3) {
