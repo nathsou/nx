@@ -91,6 +91,11 @@ python3 -m venv .venv && .venv/bin/pip install unicorn capstone lz4
    The app picks the game library built for those game files. Saves go to `save/<game>/` (see [Saves](#saves)),
    settings to `nx.ini`, shader caches to `cache/<game>/`, all in the repository folder.
 
+### iPhone and iPad
+
+`make ios GAME=dread` builds an iOS / iPadOS app with that game in it, for the Simulator so far: touch-friendly menu,
+controllers, and Apple's on-screen controller for playing by touch. See [docs/ios.md](docs/ios.md).
+
 ## Settings and the menu
 
 Press **F1** or **Esc** (or **Minus + Plus** together on a controller) for the in-game menu. The game pauses under it
@@ -225,7 +230,7 @@ hitch on a first visit. To avoid that:
 - Built on [LASRecomp](https://github.com/peiikai/LASRecomp) by Peiikai (MIT; see `LICENSE-LASRecomp` and
   `UPSTREAM.md`), the static recompilation of Link's Awakening this project started from.
 - [nxnative](https://github.com/seedds/nxnative)'s notes on Metroid Dread pointed at several of the bugs fixed here.
-- Third-party code in `third_party/`: Dear ImGui (MIT), SMAA (MIT), BIZ UDPGothic (SIL OFL) and DejaVu fonts (free
+- Third-party code in `third_party/`: Dear ImGui (MIT), SMAA (MIT), bcdec (MIT / Unlicense), BIZ UDPGothic (SIL OFL) and DejaVu fonts (free
   licence) as stand-ins for the Switch's system fonts.
 - Metroid Dread and Animal Crossing: New Horizons are © Nintendo. This project is not affiliated with or endorsed by
   Nintendo.

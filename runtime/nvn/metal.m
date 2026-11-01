@@ -4,9 +4,19 @@
 #include "ui/menu.h"
 // Metal renderer for the NVN layer: window, textures, command execution, presentation.
 #include <sys/stat.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#else
 #import <AppKit/AppKit.h>
+#endif
 #import <Metal/Metal.h>
+#if __has_include(<MetalFX/MetalFX.h>)  // (not in the iOS Simulator's SDK: no MetalFX upscaler there)
 #import <MetalFX/MetalFX.h>
+#define HAVE_METALFX 1
+#else
+#define HAVE_METALFX 0
+#endif
 #include "output_scale.h"
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
@@ -23,6 +33,7 @@
 #include "texpatch.h"
 #include "tex_hash.h"
 #include "screen_filter.h"
+#include "bc_soft.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
@@ -35,9 +46,39 @@ id<MTLBuffer> g_guest_buffer;  // wraps the guest heap so GPU addresses map to b
 uint64_t g_guest_buffer_base;
 
 // ================================================================== formats
-typedef struct { MTLPixelFormat pf; uint8_t expand_rgb; uint8_t force_alpha_one; } MtlFormat;
+typedef struct { MTLPixelFormat pf; uint8_t expand_rgb; uint8_t force_alpha_one; uint8_t bc, bc_signed; } MtlFormat;
 
+static MtlFormat mtl_format_gpu(uint32_t f);
+// A GPU without BC textures (the iOS Simulator's): those decoded on upload (bc_soft.h), to the formats here
+static bool bc_soft(void) {
+    static int on = -1;
+    if (on < 0 && dev) on = ![dev supportsBCTextureCompression] || getenv("LARECOMP_BC_SOFT");
+    if (on == 1) { static int logged; if (!logged++) LOG("[metal] no BC textures on this GPU: decoded on the CPU\n"); }
+    return on == 1;
+}
 static MtlFormat mtl_format(uint32_t f) {
+    MtlFormat m = mtl_format_gpu(f);
+    if (!bc_soft()) return m;
+    switch (m.pf) {
+    case MTLPixelFormatBC1_RGBA: return (MtlFormat){MTLPixelFormatRGBA8Unorm, .bc = BC1};
+    case MTLPixelFormatBC1_RGBA_sRGB: return (MtlFormat){MTLPixelFormatRGBA8Unorm_sRGB, .bc = BC1};
+    case MTLPixelFormatBC2_RGBA: return (MtlFormat){MTLPixelFormatRGBA8Unorm, .bc = BC2};
+    case MTLPixelFormatBC2_RGBA_sRGB: return (MtlFormat){MTLPixelFormatRGBA8Unorm_sRGB, .bc = BC2};
+    case MTLPixelFormatBC3_RGBA: return (MtlFormat){MTLPixelFormatRGBA8Unorm, .bc = BC3};
+    case MTLPixelFormatBC3_RGBA_sRGB: return (MtlFormat){MTLPixelFormatRGBA8Unorm_sRGB, .bc = BC3};
+    case MTLPixelFormatBC4_RUnorm: return (MtlFormat){MTLPixelFormatR8Unorm, .bc = BC4};
+    case MTLPixelFormatBC4_RSnorm: return (MtlFormat){MTLPixelFormatR8Snorm, .bc = BC4, .bc_signed = 1};
+    case MTLPixelFormatBC5_RGUnorm: return (MtlFormat){MTLPixelFormatRG8Unorm, .bc = BC5};
+    case MTLPixelFormatBC5_RGSnorm: return (MtlFormat){MTLPixelFormatRG8Snorm, .bc = BC5, .bc_signed = 1};
+    case MTLPixelFormatBC6H_RGBFloat: return (MtlFormat){MTLPixelFormatRGBA16Float, .bc = BC6H, .bc_signed = 1};
+    case MTLPixelFormatBC6H_RGBUfloat: return (MtlFormat){MTLPixelFormatRGBA16Float, .bc = BC6H};
+    case MTLPixelFormatBC7_RGBAUnorm: return (MtlFormat){MTLPixelFormatRGBA8Unorm, .bc = BC7};
+    case MTLPixelFormatBC7_RGBAUnorm_sRGB: return (MtlFormat){MTLPixelFormatRGBA8Unorm_sRGB, .bc = BC7};
+    default: return m;
+    }
+}
+
+static MtlFormat mtl_format_gpu(uint32_t f) {
     switch (f) {
     case 0x01: return (MtlFormat){MTLPixelFormatR8Unorm};
     case 0x02: return (MtlFormat){MTLPixelFormatR8Snorm};
@@ -662,7 +703,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                 free(lin);
                 lin = data;
             }
-            uint64_t out_sz = (uint64_t)out_row * l.hb * l.d;
+            uint32_t out_h = l.hb;  // (rows of blocks / texels)
+            if (mf.bc) {  // (bc_soft: 4x4 texels a block)
+                out_row = l.wb * 4 * bc_soft_texel_bytes(mf.bc);
+                out_h = l.hb * 4;
+                data = malloc((uint64_t)out_row * out_h * l.d);
+                bc_soft_decode(mf.bc, mf.bc_signed, lin, l.wb, l.hb, l.d, data, out_row);
+                free(lin);
+                lin = data;
+            }
+            uint64_t out_sz = (uint64_t)out_row * out_h * l.d;
             id<MTLBuffer> staging = [dev newBufferWithBytes:data length:out_sz options:MTLResourceStorageModeShared];
             free(lin);
             // the copy stays inside the texture's level: one allocated at the internal resolution (16:9, render
@@ -672,7 +722,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             MTLSize size = MTLSizeMake(MIN((NSUInteger)l.w, lw), MIN((NSUInteger)l.h, lh), MIN((NSUInteger)l.d, ld));
             NSUInteger slice = layer;
             [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:out_row
-                 sourceBytesPerImage:(NSUInteger)out_row * l.hb sourceSize:size toTexture:b->tex
+                 sourceBytesPerImage:(NSUInteger)out_row * out_h sourceSize:size toTexture:b->tex
                     destinationSlice:slice destinationLevel:lv destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
     }
@@ -948,6 +998,7 @@ static void save_png(id<MTLTexture> tex, const char *path) { renderer_save_textu
 
 // MetalFX spatial upscaling (Video tab "Upscaler" = MetalFX). metalfx_upscale() decides (and sets up the scaler for
 // this input / output size); metalfx_encode() runs it and returns the upscaled image.
+#if HAVE_METALFX
 static id<MTLFXSpatialScaler> g_fx;
 static id<MTLTexture> g_fx_out;
 static NSUInteger g_fx_iw, g_fx_ih, g_fx_ow, g_fx_oh;
@@ -983,6 +1034,12 @@ static id<MTLTexture> metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture> in
     }
     return g_fx && g_fx_out ? g_fx_out : nil;
 }
+#else
+static id<MTLTexture> metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture> in, float fx, float fy, double ow_d, double oh_d) {
+    (void)cb, (void)in, (void)fx, (void)fy, (void)ow_d, (void)oh_d;
+    return nil;
+}
+#endif
 // SMAA 1x (Video tab "Anti-aliasing"; third_party/smaa, MIT; as runtime/nvn/vulkan/shaders.c / exec.c): luma edges ->
 // blending weights -> neighbourhood blending, at the game image's size, before the present / MetalFX. The reference
 // SMAA.hlsl has no Metal mode: it is built through its SMAA_CUSTOM_SL porting macros, with a few textual fixes for
@@ -1135,12 +1192,17 @@ static id<MTLTexture> smaa_encode(id<MTLCommandBuffer> cb, id<MTLTexture> in, fl
 }
 
 static id<MTLTexture> metalfx_encode(id<MTLCommandBuffer> cb, id<MTLTexture> in, float fx, float fy) {
+#if !HAVE_METALFX  // (metalfx_upscale said no: never called)
+    (void)cb, (void)fx, (void)fy;
+    return in;
+#else
     g_fx.colorTexture = in;
     g_fx.inputContentWidth = (NSUInteger)lround(in.width * fx);
     g_fx.inputContentHeight = (NSUInteger)lround(in.height * fy);
     g_fx.outputTexture = g_fx_out;
     [g_fx encodeToCommandBuffer:cb];
     return g_fx_out;
+#endif
 }
 
 
@@ -1523,6 +1585,7 @@ static void present_image(NvnTexture *t, uint64_t frame, id<MTLTexture> img, flo
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; __atomic_sub_fetch(&g_presents_inflight, 1, __ATOMIC_RELAXED); }];
         static int log_shown = -1;  // LARECOMP_LOG_SHOWN=1: intervals between images reaching the screen, every 2 s
         if (log_shown < 0) log_shown = getenv("LARECOMP_LOG_SHOWN") != NULL;
+#if !TARGET_OS_SIMULATOR  // (no presented handlers in the Simulator)
         if (log_shown)
             [drawable addPresentedHandler:^(id<MTLDrawable> d) {
                 static CFTimeInterval last;
@@ -1538,6 +1601,7 @@ static void present_image(NvnTexture *t, uint64_t frame, id<MTLTexture> img, flo
                     memset(hist, 0, sizeof hist);
                 }
             }];
+#endif
         if (at > 0) [cb presentDrawable:drawable atTime:at];
         else if (deadline) [cb presentDrawable:drawable atTime:CACurrentMediaTime() + 1.0 / 60.0];
         else [cb presentDrawable:drawable];
@@ -1794,6 +1858,13 @@ void ui_window_init(void) {
     // macOS reading them in the background makes the system ask for Input Monitoring ("receive keystrokes from any
     // application"), so it isn't the default
     input_apply_background();
+#if TARGET_OS_IPHONE
+    // touches go to the menu (runtime/ui/menu.mm) as touches, not as a mouse; landscape only; the home bar hides
+    // until the player swipes near it
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     input_load_user_mappings();
     int win_w = 1280, win_h = 720;
@@ -1816,7 +1887,9 @@ void ui_window_init(void) {
     // The display's vsync stays on: without it frames show as soon as they're done, which tears (seen on a 5120x1440
     // display), for ~2-3 fps near the limit at most (the game paces itself to vi.c's emulated 60 Hz vsync, and the two
     // clocks drift). LARECOMP_DISPLAY_SYNC=0: off (tests).
+#if !TARGET_OS_IPHONE  // (iOS always syncs to the display)
     layer.displaySyncEnabled = !getenv("LARECOMP_DISPLAY_SYNC") || atoi(getenv("LARECOMP_DISPLAY_SYNC")) != 0;
+#endif
     layer.framebufferOnly = getenv("LARECOMP_WINDOW_SHOT") ? NO : YES;
 }
 
@@ -1867,8 +1940,13 @@ int ui_run(void) {
         SDL_GetWindowSizeInPixels(window, &w, &h);
         layer.drawableSize = CGSizeMake(w, h);
         {   // the window's display refresh rate (frame generation shows no more images than it can)
+#if TARGET_OS_IPHONE
+            UIWindow *uw = (__bridge UIWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
+            UIScreen *sc = uw.windowScene.screen ? uw.windowScene.screen : UIScreen.mainScreen;
+#else
             NSWindow *nw = (__bridge NSWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
             NSScreen *sc = nw.screen ? nw.screen : NSScreen.mainScreen;
+#endif
             int hz = sc ? (int)sc.maximumFramesPerSecond : 60;
             if (hz != g_display_hz) { LOG("[metal] display refresh %d Hz\n", hz); g_display_hz = hz; }
         }

@@ -440,13 +440,31 @@ int input_menu_family(SDL_JoystickID which) {
     return bind_label_family();
 }
 
+// Every controller is open (SDL sends events only for open ones); the game reads one - the last one used, so a second
+// controller (iOS's on-screen one next to a real one, a pad picked up from the desk) takes over with its first press.
+static void use_pad(SDL_Gamepad *g) {
+    if (!g || g == pad) return;
+    if (pad) SDL_RumbleGamepad(pad, 0, 0, 0);
+    pad = g;
+    LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
+    note_family();
+}
+static void use_pad_id(SDL_JoystickID id) {
+    if (id == TEST_DEVICE || (pad && SDL_GetGamepadID(pad) == id)) return;
+    use_pad(SDL_GetGamepadFromID(id));
+}
+
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
     if (!scanned) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        for (int i = 0; i < n; i++) {
+            SDL_Gamepad *g = SDL_GetGamepadFromID(ids[i]);
+            if (!g) g = SDL_OpenGamepad(ids[i]);
+            if (!pad) use_pad(g);
+        }
         SDL_free(ids);
     }
     switch (e->type) {
@@ -460,19 +478,34 @@ void input_handle_event(const SDL_Event *e) {
         note_press(now & ~before, before & ~now);
         break;
     }
-    case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        SDL_Gamepad *g = SDL_GetGamepadFromID(e->gdevice.which);
+        if (!g) g = SDL_OpenGamepad(e->gdevice.which);
+        if (!pad) use_pad(g);
         break;
+    }
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+        if (!pad || SDL_GetGamepadID(pad) != e->gdevice.which) {  // (another one: closed, the game's stays)
+            SDL_Gamepad *g = SDL_GetGamepadFromID(e->gdevice.which);
+            if (g) SDL_CloseGamepad(g);
+        } else {
             SDL_RumbleGamepad(pad, 0, 0, 0);
             SDL_CloseGamepad(pad); pad = NULL; note_family();
+            {   // another one still connected takes over
+                int n = 0;
+                SDL_JoystickID *ids = SDL_GetGamepads(&n);
+                for (int i = 0; i < n && !pad; i++)
+                    if (ids[i] != e->gdevice.which) use_pad(SDL_GetGamepadFromID(ids[i]));
+                SDL_free(ids);
+            }
             led_forget();  // (gone: it shows its own colour when it comes back)
             rumble_clear(); rumble_last_lo = rumble_last_hi = 0; rumble_warned = false;
         }
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (e->gbutton.down && !host_test) use_pad_id(e->gbutton.which);
+        else if (pad && e->gbutton.which != TEST_DEVICE && SDL_GetGamepadID(pad) != e->gbutton.which) break;  // (not the game's)
         if (!host_test || e->gbutton.which == TEST_DEVICE) {  // (the press as the event has it, before reading the pad)
             uint64_t b = pad_bits(e->gbutton.button);
             note_press(e->gbutton.down ? b : 0, e->gbutton.down ? 0 : b);
@@ -480,6 +513,8 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (!host_test && (e->gaxis.value > 16000 || e->gaxis.value < -16000)) use_pad_id(e->gaxis.which);  // (a stick pushed)
+        if (pad && SDL_GetGamepadID(pad) != e->gaxis.which) break;
         if ((e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) &&
             !host_test) {  // (the triggers as buttons: past half way)
             static bool trig[2];
@@ -725,6 +760,10 @@ static void live_frame(uint64_t frame) {
 
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip the opening on rando seeds)
+// iOS's on-screen Plus / Minus (runtime/ui/menu.mm: the on-screen controller has none): a tap, held for the game
+// for a few presented frames (it polls several times a frame). plus: Plus, else Minus. Any thread.
+static _Atomic uint64_t touch_tap;
+void input_touch_tap(bool plus) { atomic_fetch_or(&touch_tap, 1ull << (plus ? BTN_PLUS : BTN_MINUS)); }
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
 void input_frame(uint64_t frame) {
     atomic_store(&rumble_frame_ms, SDL_GetTicks());
@@ -874,6 +913,12 @@ static void fill_state(Cpu *c) {
         static uint64_t until;
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
+        static uint64_t touch_until, touch_held;
+        if (!menu) {
+            uint64_t t = atomic_exchange(&touch_tap, 0);
+            if (t) touch_held = t, touch_until = renderer_present_count() + 6;
+        }
+        if (!menu && renderer_present_count() < touch_until) b |= touch_held;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);

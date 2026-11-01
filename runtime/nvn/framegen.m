@@ -9,7 +9,12 @@
 // frame. When the frames differ too much for the flow (a scene cut, a menu opening), a GPU-side check shows the previous
 // or the new frame instead of a blend.
 #import <Metal/Metal.h>
+#if __has_include(<MetalFX/MetalFX.h>)  // (not in the iOS Simulator's SDK: the optical flow only there)
 #import <MetalFX/MetalFX.h>
+#define HAVE_METALFX 1
+#else
+#define HAVE_METALFX 0
+#endif
 #include <stdlib.h>
 
 #include "../hle.h"
@@ -202,8 +207,9 @@ static void dispatch(id<MTLComputeCommandEncoder> c, id<MTLComputePipelineState>
 // MetalFX frame interpolation (macOS 26), with the game's depth and the motion vectors of motion.h: the image halfway
 // between the previous game frame and this one. (One image: 60 fps from 30.) nil: not this frame (no motion vectors -
 // a menu, a loading screen - or no interpolator), the optical flow's instead.
-static id<MTLFXFrameInterpolator> fx;
-NvnTexture *fg_presented;  // (metal.m: the game image being shown - its UI layer, renderer.m)
+NvnTexture *fg_presented;
+#if HAVE_METALFX
+static id<MTLFXFrameInterpolator> fx;  // (metal.m: the game image being shown - its UI layer, renderer.m)
 static id<MTLTexture> fx_out;
 static bool fx_failed;
 bool framegen_metalfx(void) {  // (LARECOMP_FG_METALFX=0 / 1: instead of the setting)
@@ -220,6 +226,9 @@ bool framegen_metalfx(void) {  // (LARECOMP_FG_METALFX=0 / 1: instead of the set
     }
     return supported;
 }
+#else
+bool framegen_metalfx(void) { return false; }
+#endif
 
 // Motion vectors are drawn (motion.h) while MetalFX makes the in-between image: one per frame of a 30 fps game
 bool framegen_wants_motion(void) {
@@ -276,6 +285,10 @@ static id<MTLTexture> ui_image(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MT
 }
 
 static id<MTLTexture> metalfx_image(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> prev, id<MTLTexture> cur, bool reset) {
+#if !HAVE_METALFX
+    (void)dev, (void)cb, (void)prev, (void)cur, (void)reset, (void)ui_image;
+    return nil;
+#else
     extern id<MTLTexture> renderer_motion(id<MTLTexture> *depth);
     id<MTLTexture> depth = nil, motion = renderer_motion(&depth);
     // (the scene's size: a menu's small 3D view - a model, the title's island - goes to the optical flow)
@@ -321,6 +334,7 @@ static id<MTLTexture> metalfx_image(id<MTLDevice> dev, id<MTLCommandBuffer> cb, 
     fx.shouldResetHistory = reset;
     [fx encodeToCommandBuffer:cb];
     return fx_out;
+#endif
 }
 
 bool framegen_prepare(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> cur, int n) {
