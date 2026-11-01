@@ -92,6 +92,7 @@ typedef struct {
     Splitter *split;
     SplitDest *sdest;
     uint64_t elapsed_frames;
+    _Atomic uint64_t updates;  // RequestUpdate calls (LARECOMP_AUDIO_STATS)
     uint32_t event_r, event_w;
     KEvent *event;
     uint32_t state;  // 0 started, 1 stopped
@@ -1079,21 +1080,45 @@ static void *renderer_tick(void *arg) {
     uint64_t next = 0;
     struct timespec now;
     int target = 4 * frame_bytes;  // queued audio to keep ahead of the device: >= 2 device periods
+    int low = 2 * frame_bytes;     // below this the next frame can't wait for the game's update (one device period)
     if (r->stream) {
         SDL_AudioSpec dev;
         int dev_frames = 0;
         if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(r->stream), &dev, &dev_frames) && dev_frames > 0) {
             int t = (2 * dev_frames * (int)r->sample_rate / (dev.freq ? dev.freq : 48000) + (int)N) * 2 * (int)sizeof(float);
             if (t > target) target = t;
+            int l = dev_frames * (int)r->sample_rate / (dev.freq ? dev.freq : 48000) * 2 * (int)sizeof(float);
+            if (l > low) low = l;
             LOG("[audren] device %d Hz, %d frames/period; queue target %d samples\n", dev.freq, dev_frames,
                 target / (2 * (int)sizeof(float)));
         }
     }
+    // LARECOMP_AUDIO_STATS=1: every 2 s, frames rendered / game updates, the queue's lowest level, how often it ran dry
+    // and the longest gap between frames (a starved device plays silence: the crackle)
+    static int stats = -1;
+    if (stats < 0) stats = getenv("LARECOMP_AUDIO_STATS") != NULL;
+    uint64_t st_t0 = plat_now_ns(), st_last = st_t0, st_frames = 0, st_updates = r->updates, st_gap = 0;
+    int st_min = 1 << 30, st_dry = 0;
     while (!r->quit) {
         if (r->stream) {
             while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
                 struct timespec ts = {0, 1000000};
                 nanosleep(&ts, NULL);
+            }
+            if (stats) {
+                int q = SDL_GetAudioStreamQueued(r->stream) / (2 * (int)sizeof(float));
+                uint64_t t = plat_now_ns();
+                if (q < st_min) st_min = q;
+                if (q == 0) st_dry++;
+                if (t - st_last > st_gap) st_gap = t - st_last;
+                st_last = t;
+                st_frames++;
+                if (t - st_t0 >= 2000000000ull) {
+                    LOG("[audren] stats: %llu frames, %llu updates in %.1f s; queue min %d samples, dry %d times, max gap %.1f ms\n",
+                        (unsigned long long)st_frames, (unsigned long long)(r->updates - st_updates), (t - st_t0) / 1e9, st_min,
+                        st_dry, st_gap / 1e6);
+                    st_t0 = t, st_frames = 0, st_updates = r->updates, st_gap = 0, st_min = 1 << 30, st_dry = 0;
+                }
             }
         } else {
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1116,9 +1141,24 @@ static void *renderer_tick(void *arg) {
             r->wav_bytes += frame_bytes;
             if ((r->elapsed_frames & 255) == 0) { wav_header(r->wav, r->wav_bytes); fflush(r->wav); }
         }
+        uint64_t updates = r->updates;
         pthread_mutex_lock(&g_klock);
         kernel_signal(r->event);
         pthread_mutex_unlock(&g_klock);
+        // One frame per update of the game's, as the Switch's audio DSP renders every 5 ms: the device takes the queue in
+        // periods (1024 samples on an iPhone: 21 ms), and the frames that refill it rendered back to back merged their
+        // signals - the game updated for 60% of them (iPhone 17 Pro, ACNH), its voices running ahead of what it fed
+        // them: stutter and noise. So each frame waits for the game's update (at most a frame's time), unless the queue
+        // is down to a device period. LARECOMP_AUDIO_BURST=1: back to back as before.
+        static int burst = -1;
+        if (burst < 0) burst = getenv("LARECOMP_AUDIO_BURST") != NULL;
+        if (r->stream && r->state == 0 && !burst) {
+            uint64_t until = plat_now_ns() + (uint64_t)N * 1000000000ull / r->sample_rate;
+            while (r->updates == updates && !r->quit && plat_now_ns() < until && SDL_GetAudioStreamQueued(r->stream) > low) {
+                struct timespec ts = {0, 200000};
+                nanosleep(&ts, NULL);
+            }
+        }
     }
     return NULL;
 }
@@ -1303,6 +1343,7 @@ static void update_mix(Renderer *r, const uint8_t *p, int id) {
 
 // RequestUpdate: input is an UpdateDataHeader + sections; write a matching output.
 static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
+    r->updates++;
     IpcBuf *in = in_buf(req, 0), *out = out_buf(req, 0);
     if (!in || !out || !in->size || !out->size) return;
     const uint8_t *ip = (const uint8_t *)(uintptr_t)in->addr;

@@ -959,6 +959,7 @@ void backend_guest_memory_reset(void) {
 // The window goes black while the game is down (instead of holding its last frame).
 void backend_clear_window(void) {
     if (!layer || !dev || rq_stopping()) return;
+    menu_loading_end();
     rq_drain();
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
@@ -1417,6 +1418,87 @@ void backend_represent(void) {
 
 static int g_presents_inflight;  // present command buffers committed and not yet completed (each holds a drawable)
 volatile int g_display_hz = 60;  // (the UI thread keeps it: the window's screen's highest refresh rate)
+// ---- covers: a picture of each game for the selection screen (runtime/ui/menu.mm), cache/<game>/cover.jpg - a game
+// frame, 960 x 540, taken when the menu opens (the next frame drawn: the game's, once it resumes) and once a session
+// a while into play if the game has none. Frames mostly black (loading, fades) are skipped and tried again later.
+static char g_cover_path[1100];
+static _Atomic int g_cover_want;  // 1: the next game frame
+static _Atomic int g_cover_busy;  // (encoding)
+void renderer_request_cover(void) {
+    if (!g_game.key[0]) return;
+    mkdir("cache", 0755);
+    char dir[600];
+    snprintf(dir, sizeof dir, "cache/%s", g_game.key);
+    mkdir(dir, 0755);
+    snprintf(g_cover_path, sizeof g_cover_path, "%s/cover.jpg", dir);
+    g_cover_want = 1;
+}
+static void cover_capture(id<MTLCommandBuffer> cb, id<MTLTexture> src, const float pv[8], const float pf[4]) {
+    if (atomic_exchange(&g_cover_busy, 1)) return;
+    g_cover_want = 0;
+    const NSUInteger W = 960, H = 540;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:layer.pixelFormat width:W height:H mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    id<MTLBuffer> buf = [dev newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = t;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    [e setViewport:(MTLViewport){0, 0, W, H, 0, 1}];
+    [e setRenderPipelineState:present_pipe];
+    [e setVertexBytes:pv length:8 * sizeof(float) atIndex:0];
+    [e setFragmentBytes:pf length:4 * sizeof(float) atIndex:0];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:present_sampler atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
+               toBuffer:buf destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * H * 4];
+    [bl endEncoding];
+    NSString *path = @(g_cover_path);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            const uint8_t *px = buf.contents;  // (BGRA)
+            uint64_t sum = 0;
+            for (NSUInteger i = 0; i < W * H; i += 97) sum += px[i * 4] + 2 * px[i * 4 + 1] + px[i * 4 + 2];
+            double luma = sum / 4.0 / ((W * H + 96) / 97) / 255.0;
+            if (luma > 0.08) {
+                CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                CGContextRef ctx = CGBitmapContextCreate((void *)px, W, H, 8, W * 4, cs,
+                                                         kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst);
+                CGImageRef img = CGBitmapContextCreateImage(ctx);
+                NSString *tmp = [path stringByAppendingString:@".tmp"];
+                CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:tmp];
+                CGImageDestinationRef d = CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypeJPEG.identifier, 1, NULL);
+                if (d) {
+                    CGImageDestinationAddImage(d, img, (__bridge CFDictionaryRef)@{(id)kCGImageDestinationLossyCompressionQuality: @0.85});
+                    if (CGImageDestinationFinalize(d)) rename(tmp.UTF8String, path.UTF8String);
+                    CFRelease(d);
+                }
+                CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+                LOG("[metal] cover saved: %s\n", path.UTF8String);
+            }
+            g_cover_busy = 0;
+        });
+    }];
+}
+// (each game frame) the session's own cover, a while into play, when the game has none yet
+static void cover_auto(void) {
+    static char key[64];
+    static uint64_t frames;
+    if (strcmp(key, g_game.key)) { snprintf(key, sizeof key, "%s", g_game.key); frames = 0; }
+    if (++frames % 1500 || g_cover_want) return;  // (about 25 s at 60 fps, 50 at 30: then every as many while still none)
+    char p[600];
+    snprintf(p, sizeof p, "cache/%s/cover.jpg", g_game.key);
+    struct stat st;
+    if (stat(p, &st) != 0) renderer_request_cover();
+}
+
 static uint64_t g_images_shown;  // window images presented (the fps line: with frame generation, more than frames)
 void renderer_frame_counts(uint64_t *game, uint64_t *shown) { *game = total_frames, *shown = g_images_shown; }  // (the menu's fps)
 // One window image: `img` (a game image, or an in-between one from framegen.m) drawn into a drawable with the frame's
@@ -1427,6 +1509,7 @@ static void present_image(NvnTexture *t, uint64_t frame, id<MTLTexture> img, flo
     extern uint64_t renderer_gpu_busy(id<MTLCommandBuffer> done, bool win);
     float crop[4] = {crop_in[0], crop_in[1], crop_in[2], crop_in[3]};
     {
+        menu_loading_end();  // (the loading screen's drawing stops: the game's frames take the window)
         uint64_t nd0 = SDL_GetTicksNS();
         rq_watch("nextDrawable", frame);
         id<CAMetalDrawable> drawable = [layer nextDrawable];
@@ -1492,6 +1575,18 @@ static void present_image(NvnTexture *t, uint64_t frame, id<MTLTexture> img, flo
             [enc setFragmentTexture:src atIndex:0];
             [enc setFragmentSamplerState:present_sampler atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (real) {
+                cover_auto();
+                if (g_cover_want) {
+                    [enc endEncoding];
+                    cover_capture(cb, src, pv, pf);
+                    MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rp2.colorAttachments[0].texture = drawable.texture;
+                    rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                    rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    enc = [cb renderCommandEncoderWithDescriptor:rp2];
+                }
+            }
         }
         [enc endEncoding];
         static long menu_at = -1;  // test hook: open the menu at this frame (LARECOMP_MENU_AT)

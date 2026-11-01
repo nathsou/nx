@@ -22,6 +22,8 @@
 #define HAVE_METALFX (!TARGET_OS_SIMULATOR)  // (the iOS Simulator has no MetalFX: renderer bilinear / optical flow)
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <ImageIO/ImageIO.h>
+#include <pthread.h>
 #include <SDL3/SDL.h>
 
 #include <sys/stat.h>
@@ -91,11 +93,17 @@ static double button_visibility(void) {  // 1 shown, 0 hidden, between: fading o
 }
 extern "C" int g_game_count;  // runtime/main.c: games in the app's Documents
 #endif
+// The loading screen (menu_loading_begin, drawn by its own thread until the game's first frame)
+static std::atomic<bool> g_loading{false}, g_loading_stop{false};
 // The game selection screen (menu_pick_game, main thread): its games, and the one picked
 static bool g_picking;
 static int g_pick_n, g_picked = -1;
 static const char *const *g_pick_titles, *const *g_pick_details;
 static const bool *g_pick_playable;
+extern "C" void *ui_metal_layer(void);
+extern "C" void *ui_metal_device(void);
+extern "C" SDL_Window *ui_window(void);
+extern "C" void input_handle_event(const SDL_Event *e);
 
 extern "C" {
 
@@ -108,6 +116,7 @@ bool menu_pauses_game(void) { return g_open && g_settings.menu_pause && !rt_rebo
 static void set_open(bool on) {
     if (g_open == on) return;
     g_open = on;
+    if (on) renderer_request_cover();  // (the game's picture for the selection screen: its next frame, once resumed)
     input_reset();  // (keys held when it opened don't stay pressed for the game)
 }
 void menu_test_open(void) { set_open(true); }
@@ -326,7 +335,7 @@ extern "C" void menu_apply_window_requests(void *win) {
     float d = SDL_GetWindowPixelDensity(w);
     if (d > 0) g_density = d;
 #if MENU_TOUCH
-    touch_pad_update(g_open || g_picking);
+    touch_pad_update(g_open || g_picking || g_loading);
     g_pad_buttons = touch_pad_shown();
     SDL_GetWindowSizeInPixels(w, &g_win_w, &g_win_h);
     SDL_Rect sa;
@@ -439,152 +448,301 @@ static void menu_reset(void) {  // (runtime/main.c's reboot: every guest thread 
 __attribute__((used, section("__DATA,__rt_reset"))) static const ResetFn menu_reset_entry = menu_reset;
 
 // ------------------------------------------------------------------ drawing (render thread)
+// The look: a panel over the dimmed game - pages listed down the left, each setting a row (its name and help on the
+// left, its control on the right) in rounded cards; switches for on / off, segmented buttons for short lists.
 static bool g_inited;
-static float g_scale;  // the UI's size: the window's height over 900 points' worth
+static float g_scale;  // the UI's size: the window's height over 900 points' worth (iOS: points, for fingers)
+static ImFont *g_bold, *g_title, *g_small;
+static id<MTLDevice> g_dev;
+static const ImVec4 C_ACCENT(0.40f, 0.84f, 0.64f, 1), C_PANEL(0.075f, 0.082f, 0.100f, 0.985f), C_SIDE(0.055f, 0.060f, 0.074f, 1);
+static const ImVec4 C_CARD(0.115f, 0.125f, 0.150f, 1), C_TEXT(0.93f, 0.95f, 0.97f, 1), C_MUTED(0.60f, 0.64f, 0.69f, 1);
+static const ImVec4 C_CONTROL(0.20f, 0.215f, 0.25f, 1), C_ON_ACCENT(0.04f, 0.10f, 0.07f, 1);
+static ImU32 col(ImVec4 c, float a = -1) { if (a >= 0) c.w = a; return ImGui::ColorConvertFloat4ToU32(c); }
+
 static void setup_style(float scale) {
     ImGuiStyle &st = ImGui::GetStyle();
     st = ImGuiStyle();
     ImGui::StyleColorsDark();
-    st.WindowRounding = 10, st.FrameRounding = 6, st.GrabRounding = 6, st.TabRounding = 6, st.PopupRounding = 8;
-    st.WindowPadding = ImVec2(18, 14), st.FramePadding = ImVec2(10, 6), st.ItemSpacing = ImVec2(10, 8);
+    st.WindowRounding = 16, st.ChildRounding = 12, st.FrameRounding = 9, st.GrabRounding = 9, st.PopupRounding = 12;
+    st.TabRounding = 8, st.ScrollbarRounding = 9;
+    st.WindowPadding = ImVec2(20, 16), st.FramePadding = ImVec2(12, 7), st.ItemSpacing = ImVec2(10, 9);
+    st.ItemInnerSpacing = ImVec2(8, 6), st.WindowBorderSize = 0, st.PopupBorderSize = 0, st.ChildBorderSize = 0;
+    st.ScrollbarSize = 12, st.GrabMinSize = 18;
 #if MENU_TOUCH  // (fingers: taller rows and scroll bars, a margin around what can be touched)
-    st.FramePadding = ImVec2(14, 11), st.ItemSpacing = ImVec2(12, 10), st.ItemInnerSpacing = ImVec2(10, 6);
-    st.ScrollbarSize = 22, st.GrabMinSize = 26, st.TouchExtraPadding = ImVec2(4, 4), st.TabBarBorderSize = 2;
-    st.WindowPadding = ImVec2(20, 16);
+    st.FramePadding = ImVec2(14, 11), st.ItemSpacing = ImVec2(12, 11), st.ItemInnerSpacing = ImVec2(10, 6);
+    st.ScrollbarSize = 18, st.GrabMinSize = 26, st.TouchExtraPadding = ImVec2(4, 4);
 #endif
     ImVec4 *c = st.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.11f, 0.96f);
-    c[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.14f, 0.98f);
-    c[ImGuiCol_Header] = ImVec4(0.20f, 0.45f, 0.35f, 0.55f);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.55f, 0.42f, 0.80f);
-    c[ImGuiCol_HeaderActive] = ImVec4(0.26f, 0.62f, 0.47f, 1.00f);
-    c[ImGuiCol_Button] = ImVec4(0.20f, 0.45f, 0.35f, 0.60f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.55f, 0.42f, 1.00f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.26f, 0.62f, 0.47f, 1.00f);
-    c[ImGuiCol_Tab] = ImVec4(0.16f, 0.30f, 0.25f, 0.85f);
-    c[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.55f, 0.42f, 1.00f);
-    c[ImGuiCol_TabSelected] = ImVec4(0.22f, 0.50f, 0.39f, 1.00f);
-    c[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.18f, 0.21f, 1.00f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.24f, 0.28f, 1.00f);
-    c[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.85f, 0.65f, 1.00f);
-    c[ImGuiCol_SliderGrab] = ImVec4(0.45f, 0.85f, 0.65f, 1.00f);
-    c[ImGuiCol_NavCursor] = ImVec4(0.45f, 0.85f, 0.65f, 1.00f);
+    c[ImGuiCol_Text] = C_TEXT;
+    c[ImGuiCol_TextDisabled] = C_MUTED;
+    c[ImGuiCol_WindowBg] = C_PANEL;
+    c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_PopupBg] = ImVec4(0.11f, 0.12f, 0.145f, 0.99f);
+    c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.55f);
+    c[ImGuiCol_FrameBg] = C_CONTROL;
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.27f, 0.31f, 1);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.28f, 0.30f, 0.35f, 1);
+    c[ImGuiCol_Button] = C_CONTROL;
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.25f, 0.27f, 0.31f, 1);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.29f, 0.31f, 0.36f, 1);
+    c[ImGuiCol_Header] = ImVec4(C_ACCENT.x, C_ACCENT.y, C_ACCENT.z, 0.22f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(C_ACCENT.x, C_ACCENT.y, C_ACCENT.z, 0.30f);
+    c[ImGuiCol_HeaderActive] = ImVec4(C_ACCENT.x, C_ACCENT.y, C_ACCENT.z, 0.40f);
+    c[ImGuiCol_CheckMark] = C_ACCENT;
+    c[ImGuiCol_SliderGrab] = C_ACCENT;
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.55f, 0.92f, 0.75f, 1);
+    c[ImGuiCol_NavCursor] = C_ACCENT;
+    c[ImGuiCol_Separator] = ImVec4(1, 1, 1, 0.07f);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.14f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(1, 1, 1, 0.22f);
+    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(1, 1, 1, 0.30f);
+    c[ImGuiCol_TextSelectedBg] = ImVec4(C_ACCENT.x, C_ACCENT.y, C_ACCENT.z, 0.35f);
     st.ScaleAllSizes(scale);
 }
 static const char *font_path(const char *file) {
-    static char p[1024];
-    snprintf(p, sizeof p, "third_party/fonts/DejaVu/%s", file);
-    if (access(p, R_OK) == 0) return p;
-    NSString *r = [[NSBundle mainBundle] pathForResource:@(file) ofType:nil];  // (the app: Contents/Resources)
-    return r ? r.UTF8String : NULL;
+    static char p[4][1024];
+    static int k;
+    char *out = p[k++ & 3];
+    snprintf(out, 1024, "third_party/fonts/DejaVu/%s", file);
+    if (access(out, R_OK) == 0) return out;
+    NSString *r = [[NSBundle mainBundle] pathForResource:@(file) ofType:nil];  // (the app: Contents/Resources, iOS: its root)
+    if (!r) return NULL;
+    snprintf(out, 1024, "%s", r.UTF8String);
+    return out;
 }
 static void setup_fonts(float scale) {
     ImGuiIO &io = ImGui::GetIO();
     io.Fonts->Clear();
     ImFontConfig fc;
     fc.OversampleH = 2;
-    const char *p = font_path("DejaVuSans.ttf");
-    if (p) io.Fonts->AddFontFromFileTTF(p, 17.0f * scale, &fc);
+    const char *reg = font_path("DejaVuSans.ttf"), *bold = font_path("DejaVuSans-Bold.ttf");
+    if (reg) io.Fonts->AddFontFromFileTTF(reg, 17.0f * scale, &fc);
     else io.Fonts->AddFontDefault();
+    g_bold = bold ? io.Fonts->AddFontFromFileTTF(bold, 17.0f * scale, &fc) : io.Fonts->Fonts[0];
+    g_title = bold ? io.Fonts->AddFontFromFileTTF(bold, 27.0f * scale, &fc) : io.Fonts->Fonts[0];
+    g_small = reg ? io.Fonts->AddFontFromFileTTF(reg, 14.5f * scale, &fc) : io.Fonts->Fonts[0];
 }
 
-static void help(const char *text) {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.70f, 1));
-    ImGui::PushTextWrapPos(0);
+static float em(void) { return ImGui::GetFontSize(); }
+static void help_at(const char *text, float wrap) {  // (small, muted, wrapped at wrap: 0 the window's edge)
+    ImGui::PushFont(g_small);
+    ImGui::PushStyleColor(ImGuiCol_Text, C_MUTED);
+    ImGui::PushTextWrapPos(wrap);
     ImGui::TextUnformatted(text);
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
+    ImGui::PopFont();
 }
-static bool combo(const char *label, int *v, const char *const *names, const int *values, int n) {
+static void help(const char *text) { help_at(text, 0); }
+// A card: a rounded box of related settings, with a small heading above it (title NULL: none)
+static void card_begin(const char *id, const char *title) {
+    if (title) {
+        ImGui::PushFont(g_small);
+        ImGui::PushStyleColor(ImGuiCol_Text, C_MUTED);
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+    }
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, C_CARD);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em() * 0.95f, em() * 0.8f));
+    ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_NavFlattened,
+                      ImGuiWindowFlags_NoScrollbar);
+}
+static void card_end(void) {
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, em() * 0.5f));
+}
+// A setting's row: its name (and help under it) on the left, its control right-aligned and ctrl_w wide (row_begin
+// leaves the cursor there); on a narrow card the control goes under the name. row_end: the next row.
+static float g_row_end;
+static void row_begin(const char *label, const char *helptext, float ctrl_w) {
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImVec2 p = ImGui::GetCursorPos();
+    float lw = avail - ctrl_w - em();
+    if (lw < avail * 0.34f) {  // (stacked)
+        ImGui::TextUnformatted(label);
+        if (helptext) help(helptext);
+        g_row_end = 0;
+        return;
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(p.x + lw);
+    ImGui::TextUnformatted(label);
+    ImGui::PopTextWrapPos();
+    if (helptext) help_at(helptext, p.x + lw);
+    g_row_end = ImGui::GetCursorPosY();
+    ImGui::SetCursorPos(ImVec2(p.x + avail - ctrl_w, p.y));
+}
+static void row_end(void) {
+    if (ImGui::GetCursorPosY() < g_row_end) ImGui::SetCursorPosY(g_row_end);
+    ImGui::Dummy(ImVec2(0, em() * 0.15f));
+}
+static float toggle_w(void) { return ImGui::GetFrameHeight() * 1.8f; }
+static bool toggle(const char *id, bool *v) {  // (an on / off switch)
+    float h = ImGui::GetFrameHeight(), w = toggle_w();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h));
+    if (pressed) *v = !*v;
+    bool hov = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float pad = h * 0.13f, r = h * 0.5f - pad;
+    ImVec4 track = *v ? C_ACCENT : ImVec4(0.27f, 0.29f, 0.33f, 1);
+    if (hov) track = ImVec4(track.x * 1.08f, track.y * 1.08f, track.z * 1.08f, 1);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(track), h * 0.5f);
+    float x = *v ? p.x + w - pad - r : p.x + pad + r;
+    dl->AddCircleFilled(ImVec2(x, p.y + h * 0.5f), r, IM_COL32(250, 252, 255, 255), 24);
+    return pressed;
+}
+static float seg_w(const char *const *names, int n) {
+    float m = 0;
+    for (int i = 0; i < n; i++) m = fmaxf(m, ImGui::CalcTextSize(names[i]).x);
+    return n * (m + em() * 1.6f);
+}
+static bool segmented(const char *id, int *v, const char *const *names, const int *values, int n, float w) {
+    ImGui::PushID(id);
+    float h = ImGui::GetFrameHeight(), bw = w / n, rr = ImGui::GetStyle().FrameRounding, in = em() * 0.16f;
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), col(C_CONTROL), rr);
+    bool changed = false;
+    for (int i = 0; i < n; i++) {
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + i * bw, p0.y));
+        ImGui::PushID(i);
+        bool sel = values[i] == *v;
+        if (ImGui::InvisibleButton("s", ImVec2(bw, h))) { *v = values[i]; changed = true; }
+        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        if (sel) dl->AddRectFilled(ImVec2(a.x + in, a.y + in), ImVec2(b.x - in, b.y - in), col(C_ACCENT), rr - in);
+        else if (ImGui::IsItemHovered()) dl->AddRectFilled(ImVec2(a.x + in, a.y + in), ImVec2(b.x - in, b.y - in), IM_COL32(255, 255, 255, 18), rr - in);
+        ImVec2 ts = ImGui::CalcTextSize(names[i]);
+        dl->AddText(ImVec2(a.x + (bw - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f), col(sel ? C_ON_ACCENT : C_TEXT), names[i]);
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+    return changed;
+}
+static bool combo(const char *id, int *v, const char *const *names, const int *values, int n, float w) {
     int cur = 0;
     for (int i = 0; i < n; i++) if (values[i] == *v) cur = i;
     bool changed = false;
-    if (ImGui::BeginCombo(label, names[cur])) {
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::BeginCombo(id, names[cur])) {
         for (int i = 0; i < n; i++)
             if (ImGui::Selectable(names[i], i == cur)) { *v = values[i]; changed = true; }
         ImGui::EndCombo();
     }
     return changed;
 }
+static float combo_w(const char *const *names, int n) {
+    float m = 0;
+    for (int i = 0; i < n; i++) m = fmaxf(m, ImGui::CalcTextSize(names[i]).x);
+    return m + ImGui::GetFrameHeight() + em() * 1.6f;
+}
+static bool button(const char *label, bool primary = false, float w = 0) {
+    if (primary) {
+        ImGui::PushStyleColor(ImGuiCol_Button, C_ACCENT);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.50f, 0.90f, 0.72f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.94f, 0.78f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, C_ON_ACCENT);
+    }
+    bool r = ImGui::Button(label, ImVec2(w, 0));
+    if (primary) ImGui::PopStyleColor(4);
+    return r;
+}
 static bool confirm(const char *id, const char *text, const char *yes) {  // (a modal: true when confirmed)
     bool ok = false;
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal(id, NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em() * 1.4f, em() * 1.2f));
+    if (ImGui::BeginPopupModal(id, NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
         g_popup = true;
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28);
+        ImGui::PushFont(g_bold);
+        ImGui::TextUnformatted(id);
+        ImGui::PopFont();
+        ImGui::PushTextWrapPos(em() * 24);
+        ImGui::PushStyleColor(ImGuiCol_Text, C_MUTED);
         ImGui::TextUnformatted(text);
+        ImGui::PopStyleColor();
         ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        if (ImGui::Button(yes)) { ok = true; ImGui::CloseCurrentPopup(); }
+        ImGui::Dummy(ImVec2(0, em() * 0.4f));
+        if (button(yes, true)) { ok = true; ImGui::CloseCurrentPopup(); }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+        if (button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+    ImGui::PopStyleVar();
     return ok;
 }
+static void separator(void) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y), ImVec2(p.x + ImGui::GetContentRegionAvail().x, p.y), IM_COL32(255, 255, 255, 16));
+    ImGui::Dummy(ImVec2(0, em() * 0.35f));
+}
 
-static void tab_game(void) {
-    ImGui::Text("%s", menu_game_name());
-    help(g_settings.menu_pause ? "The game is paused while this menu is open." : "The game keeps running while this menu is open.");
-    ImGui::Spacing();
-    if (ImGui::Button("Resume")) set_open(false);
+// ---- the pages
+static void page_game(void) {
+    card_begin("##play", NULL);
+    help(g_settings.menu_pause ? "Paused while this menu is open." : "The game keeps running while this menu is open.");
+    ImGui::Dummy(ImVec2(0, em() * 0.3f));
+    if (button("Resume", true)) set_open(false);
     ImGui::SameLine();
-    if (ImGui::Button("Restart game")) ImGui::OpenPopup("Restart?");
-#if !MENU_TOUCH  // (an iOS app doesn't quit itself: the app switcher closes it)
-    ImGui::SameLine();
-    if (ImGui::Button("Quit")) ImGui::OpenPopup("Quit?");
-#endif
+    if (button("Restart game")) ImGui::OpenPopup("Restart the game?");
 #if MENU_TOUCH
     if (g_game_count > 1) {
         ImGui::SameLine();
-        if (ImGui::Button("Switch game")) ImGui::OpenPopup("Switch game?");
+        if (button("Switch game")) ImGui::OpenPopup("Switch game?");
     }
-    if (confirm("Switch game?", "Go back to the game selection? Progress since the game last saved is lost.", "Switch game")) {
+    if (confirm("Switch game?", "Back to the game selection. Progress since the game last saved is lost.", "Switch game")) {
         set_open(false);
         rt_request_reboot(REBOOT_TITLE);
     }
-#endif
-    if (confirm("Restart?", "Restart the game? Progress since the game last saved is lost.", "Restart")) {
-        set_open(false);
-        rt_request_reboot(REBOOT_GAME);
-    }
-    if (confirm("Quit?", "Quit? Progress since the game last saved is lost.", "Quit")) {
+#else  // (an iOS app doesn't quit itself: the app switcher closes it)
+    ImGui::SameLine();
+    if (button("Quit")) ImGui::OpenPopup("Quit?");
+    if (confirm("Quit?", "Progress since the game last saved is lost.", "Quit")) {
         SDL_Event q = {};
         q.type = SDL_EVENT_QUIT;
         SDL_PushEvent(&q);
     }
-    ImGui::Spacing();
-    ImGui::SeparatorText("Menu");
-    if (ImGui::Checkbox("Pause the game while this menu is open", &g_settings.menu_pause)) settings_save();
-#if MENU_TOUCH
-    help("Open this menu with the button at the top of the screen (touch the screen to show it), or Home - or Minus "
-         "and Plus together - on a controller (F1 or Esc on a keyboard).");
-#else
-    help("Open and close this menu with F1 or Esc, or Home - or Minus and Plus together - on a controller.");
 #endif
+    if (confirm("Restart the game?", "Progress since the game last saved is lost.", "Restart")) {
+        set_open(false);
+        rt_request_reboot(REBOOT_GAME);
+    }
+    card_end();
+    card_begin("##menu", "THIS MENU");
+    row_begin("Pause the game while it's open", NULL, toggle_w());
+    if (toggle("##pause", &g_settings.menu_pause)) settings_save();
+    row_end();
+#if MENU_TOUCH
+    help("Open it with the button at the top of the screen (touch the screen to show it), Home or Minus + Plus on a "
+         "controller, or F1 / Esc on a keyboard.");
+#else
+    help("Open and close it with F1 or Esc, or Home or Minus + Plus on a controller.");
+#endif
+    card_end();
 }
 
-static void tab_saves(void) {
+static void page_saves(void) {
     double now = ImGui::GetTime();
     if (g_backups_listed < 0 || now - g_backups_listed > 5) { list_backups(); g_backups_listed = now; }
     std::error_code ec;
     fs::path root = fs::absolute(save_root(), ec);
-    help("The game saves into the folders below (it writes them when it saves, as on a Switch). A backup is a copy of "
-         "them; restoring one copies it back and restarts the game, after backing up the current save first.");
-    ImGui::Spacing();
     time_t newest = 0;
     uintmax_t bytes = 0;
     int mounts = 0;
     for (auto &d : fs::directory_iterator(save_root(), ec))
         if (is_mount(d)) { bytes += dir_bytes(d.path(), &newest); mounts++; }
-    ImGui::SeparatorText("Current save");
-    if (mounts) ImGui::Text("Last written %s  (%s)", format_time(newest).c_str(), human_bytes(bytes).c_str());
-    else ImGui::TextUnformatted("No save yet.");
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-    ImGui::TextWrapped("%s", root.c_str());
-    ImGui::PopStyleColor();
+    card_begin("##current", "CURRENT SAVE");
+    ImGui::PushFont(g_bold);
+    if (mounts) ImGui::Text("Last saved %s", format_time(newest).c_str());
+    else ImGui::TextUnformatted("No save yet");
+    ImGui::PopFont();
+    help(mounts ? (human_bytes(bytes) + "  ·  " + root.string()).c_str() : root.c_str());
+    ImGui::Dummy(ImVec2(0, em() * 0.2f));
 #if MENU_TOUCH
-    if (ImGui::Button("Show in the Files app")) {  // (shareddocuments://<path>: the Files app, at that folder)
+    if (button("Show in the Files app")) {  // (shareddocuments://<path>: the Files app, at that folder)
         NSString *path = @(root.c_str());
         dispatch_async(dispatch_get_main_queue(), ^{
             NSURL *u = [NSURL URLWithString:[@"shareddocuments://" stringByAppendingString:
@@ -593,17 +751,22 @@ static void tab_saves(void) {
         });
     }
 #else
-    if (ImGui::Button("Open the saves folder")) {
+    if (button("Open the saves folder")) {
         NSString *path = @(root.c_str());
         dispatch_async(dispatch_get_main_queue(), ^{ [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]]; });
     }
 #endif
-    ImGui::SeparatorText("Backups");
+    card_end();
+    card_begin("##backups", "BACKUPS");
+    help("A backup is a copy of the save. Restoring one puts it back and restarts the game, after backing up the "
+         "current save first.");
+    ImGui::Dummy(ImVec2(0, em() * 0.2f));
     static char label[64];
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
-    ImGui::InputTextWithHint("##label", "name (optional)", label, sizeof label);
+    float bw = ImGui::CalcTextSize("Back up now").x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x);
+    ImGui::InputTextWithHint("##label", "Name (optional)", label, sizeof label);
     ImGui::SameLine();
-    if (ImGui::Button("Back up now")) {
+    if (button("Back up now", true)) {
         fs::path made;
         std::string err = back_up(label, &made);
         g_status = err.empty() ? "Backed up to " + made.filename().string() : "Backup failed: " + err;
@@ -611,60 +774,70 @@ static void tab_saves(void) {
         g_backups_listed = -1;
     }
     if (!g_status.empty()) help(g_status.c_str());
+    ImGui::Dummy(ImVec2(0, em() * 0.3f));
     static int pick = -1;
-    if (g_backups.empty()) help("No backups yet. (Copies of save folders put in backups/ appear here too.)");
-    else if (ImGui::BeginTable("backups", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 3);
-        ImGui::TableSetupColumn("Date", ImGuiTableColumnFlags_WidthStretch, 2);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 1);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
-        ImGui::TableHeadersRow();
-        for (int i = 0; i < (int)g_backups.size(); i++) {
-            const Backup &b = g_backups[i];
-            ImGui::PushID(i);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(b.name.c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(format_time(b.when).c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(human_bytes(b.bytes).c_str());
-            ImGui::TableNextColumn();
-            if (ImGui::SmallButton("Restore")) { pick = i; ImGui::OpenPopup("Restore?"); }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Delete")) { pick = i; ImGui::OpenPopup("Delete?"); }
-            if (pick == i) {
-                std::string q = "Restore \"" + b.name + "\"? The game restarts with it. Your current save is backed up first.";
-                if (confirm("Restore?", q.c_str(), "Restore and restart")) {
-                    g_restore_from = fs::absolute(b.path, ec);
-                    g_restore_root = fs::absolute(save_root(), ec);
-                    set_open(false);
-                    rt_request_reboot(REBOOT_GAME);
-                }
-                std::string d = "Delete the backup \"" + b.name + "\"? This can't be undone.";
-                if (confirm("Delete?", d.c_str(), "Delete")) {
-                    fs::remove_all(b.path, ec);
-                    g_status = ec ? "Could not delete: " + ec.message() : "Deleted " + b.name;
-                    g_backups_listed = -1;
-                }
+    if (g_backups.empty()) help("No backups yet.");
+    for (int i = 0; i < (int)g_backups.size(); i++) {
+        const Backup &b = g_backups[i];
+        ImGui::PushID(i);
+        separator();
+        float rw = ImGui::CalcTextSize("Restore").x + ImGui::CalcTextSize("Delete").x + ImGui::GetStyle().FramePadding.x * 4 +
+                   ImGui::GetStyle().ItemSpacing.x;
+        float x0 = ImGui::GetCursorPosX(), avail = ImGui::GetContentRegionAvail().x;
+        ImGui::BeginGroup();
+        ImGui::PushTextWrapPos(x0 + avail - rw - em());
+        ImGui::TextUnformatted(b.name.c_str());
+        ImGui::PopTextWrapPos();
+        help((format_time(b.when) + "  ·  " + human_bytes(b.bytes)).c_str());
+        ImGui::EndGroup();
+        ImGui::SameLine(x0 + avail - rw);
+        if (button("Restore")) { pick = i; ImGui::OpenPopup("Restore this backup?"); }
+        ImGui::SameLine();
+        if (button("Delete")) { pick = i; ImGui::OpenPopup("Delete this backup?"); }
+        if (pick == i) {
+            std::string q = "\"" + b.name + "\" replaces the current save (backed up first) and the game restarts.";
+            if (confirm("Restore this backup?", q.c_str(), "Restore and restart")) {
+                g_restore_from = fs::absolute(b.path, ec);
+                g_restore_root = fs::absolute(save_root(), ec);
+                set_open(false);
+                rt_request_reboot(REBOOT_GAME);
             }
-            ImGui::PopID();
+            std::string d = "\"" + b.name + "\" is deleted for good.";
+            if (confirm("Delete this backup?", d.c_str(), "Delete")) {
+                fs::remove_all(b.path, ec);
+                g_status = ec ? "Could not delete: " + ec.message() : "Deleted " + b.name;
+                g_backups_listed = -1;
+            }
         }
-        ImGui::EndTable();
+        ImGui::PopID();
     }
+    card_end();
 }
 
-static void tab_time(void) {
+static void page_time(void) {
     time_t game = (time_t)time_game_now();
-    ImGui::Text("The game's clock:  %s", format_time(game, "%A %d %B %Y, %H:%M:%S").c_str());
-    help("Games that follow the time of day (Animal Crossing's seasons, shops, visitors) see this clock. Animal Crossing "
-         "reads it when it starts, as on a Switch: restart the game after changing it. It treats a jump as time travel.");
-    ImGui::Spacing();
-    bool custom = g_settings.time_offset != 0;
-    if (ImGui::RadioButton(MENU_TOUCH ? "This device's date and time" : "This Mac's date and time", !custom) && custom) {
-        g_settings.time_offset = 0;
-        settings_save();
-        time_offset_changed();
-    }
+    card_begin("##clock", NULL);
+    ImGui::PushFont(g_title);
+    ImGui::TextUnformatted(format_time(game, "%H:%M").c_str());
+    ImGui::PopFont();
     ImGui::SameLine();
-    ImGui::RadioButton("A date and time of my own", custom);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(format_time(game, "%A %d %B %Y").c_str());
+    help("Games that follow the time of day (Animal Crossing's seasons, shops and visitors) see this clock. Animal "
+         "Crossing reads it when it starts, as on a Switch: restart the game after changing it.");
+    card_end();
+    static bool editing;
+    int mode = g_settings.time_offset != 0 || editing ? 1 : 0;
+    card_begin("##source", "THE GAME'S CLOCK");
+    static const char *const sn[] = {MENU_TOUCH ? "This device's" : "This Mac's", "My own"};
+    static const int sv[] = {0, 1};
+    float w = seg_w(sn, 2);
+    row_begin("Date and time", NULL, w);
+    if (segmented("##src", &mode, sn, sv, 2, w)) {
+        editing = mode == 1;
+        if (!mode && g_settings.time_offset) { g_settings.time_offset = 0; settings_save(); time_offset_changed(); }
+    }
+    row_end();
     static int y, mo, d, h, mi;
     static time_t shown = -1;
     if (shown != game / 60) {  // (the fields follow the clock until edited)
@@ -673,140 +846,199 @@ static void tab_time(void) {
         y = tm.tm_year + 1900, mo = tm.tm_mon + 1, d = tm.tm_mday, h = tm.tm_hour, mi = tm.tm_min;
         shown = game / 60;
     }
-    ImGui::SeparatorText("Set the game's clock");
-    float w = ImGui::GetFontSize() * 7.5f;
-    ImGui::SetNextItemWidth(w * 1.2f); bool e1 = ImGui::InputInt("Year", &y, 1);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(w); bool e2 = ImGui::InputInt("Month", &mo, 1);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(w); bool e3 = ImGui::InputInt("Day", &d, 1);
-    ImGui::SetNextItemWidth(w * 1.2f); bool e4 = ImGui::InputInt("Hour", &h, 1);
-    ImGui::SameLine(); ImGui::SetNextItemWidth(w); bool e5 = ImGui::InputInt("Minute", &mi, 1);
-    if (e1 || e2 || e3 || e4 || e5) shown = -2;  // (being edited: kept)
-    y = y < 2000 ? 2000 : y > 2060 ? 2060 : y, mo = mo < 1 ? 1 : mo > 12 ? 12 : mo, d = d < 1 ? 1 : d > 31 ? 31 : d;
-    h = h < 0 ? 0 : h > 23 ? 23 : h, mi = mi < 0 ? 0 : mi > 59 ? 59 : mi;
     auto set_to = [&](time_t target) {
         g_settings.time_offset = (long long)(target - time(NULL));
         settings_save();
         time_offset_changed();
         shown = -1;
     };
-    if (ImGui::Button("Set the clock")) {
-        struct tm tm = {};
-        tm.tm_year = y - 1900, tm.tm_mon = mo - 1, tm.tm_mday = d, tm.tm_hour = h, tm.tm_min = mi, tm.tm_isdst = -1;
-        set_to(mktime(&tm));
+    if (mode == 1) {
+        separator();
+        float fw = em() * 7.5f;
+        bool e = false;
+        struct { const char *name; int *v; } f[] = {{"Year", &y}, {"Month", &mo}, {"Day", &d}, {"Hour", &h}, {"Minute", &mi}};
+        for (int i = 0; i < 5; i++) {
+            if (i && i != 3) ImGui::SameLine();
+            ImGui::BeginGroup();
+            help(f[i].name);
+            ImGui::PushID(i);
+            ImGui::SetNextItemWidth(i ? fw : fw * 1.15f);
+            e |= ImGui::InputInt("##v", f[i].v, 1);
+            ImGui::PopID();
+            ImGui::EndGroup();
+        }
+        if (e) shown = -2;  // (being edited: kept)
+        y = y < 2000 ? 2000 : y > 2060 ? 2060 : y, mo = mo < 1 ? 1 : mo > 12 ? 12 : mo, d = d < 1 ? 1 : d > 31 ? 31 : d;
+        h = h < 0 ? 0 : h > 23 ? 23 : h, mi = mi < 0 ? 0 : mi > 59 ? 59 : mi;
+        ImGui::Dummy(ImVec2(0, em() * 0.2f));
+        if (button("Set the clock", true)) {
+            struct tm tm = {};
+            tm.tm_year = y - 1900, tm.tm_mon = mo - 1, tm.tm_mday = d, tm.tm_hour = h, tm.tm_min = mi, tm.tm_isdst = -1;
+            set_to(mktime(&tm));
+        }
+        static const char *const qn[] = {"-1 day", "+1 day", "-1 hour", "+1 hour"};
+        static const int qd[] = {-86400, 86400, -3600, 3600};
+        for (int i = 0; i < 4; i++) {
+            ImGui::SameLine();
+            if (button(qn[i])) set_to(game + qd[i]);
+        }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("-1 day")) set_to(game - 86400);
-    ImGui::SameLine();
-    if (ImGui::Button("+1 day")) set_to(game + 86400);
-    ImGui::SameLine();
-    if (ImGui::Button("-1 hour")) set_to(game - 3600);
-    ImGui::SameLine();
-    if (ImGui::Button("+1 hour")) set_to(game + 3600);
-    ImGui::Spacing();
-    if (ImGui::Button("Restart the game with this clock")) ImGui::OpenPopup("Restart now?");
-    if (confirm("Restart now?", "Restart the game? Progress since the game last saved is lost.", "Restart")) {
+    card_end();
+    card_begin("##restart", NULL);
+    row_begin("Restart the game", "To start it with this clock.", ImGui::CalcTextSize("Restart").x + em() * 1.6f);
+    if (button("Restart")) ImGui::OpenPopup("Restart the game?");
+    row_end();
+    if (confirm("Restart the game?", "Progress since the game last saved is lost.", "Restart")) {
         set_open(false);
         rt_request_reboot(REBOOT_GAME);
     }
+    card_end();
 }
 
-static void tab_video(void) {
+static void page_video(void) {
     bool changed = false;
-    ImGui::SeparatorText(MENU_TOUCH ? "Screen" : "Window");
+    card_begin("##screen", MENU_TOUCH ? "SCREEN" : "WINDOW");
 #if !MENU_TOUCH
-    if (ImGui::Checkbox("Fullscreen (F11)", &g_settings.fullscreen)) { g_want_fullscreen_apply = true; changed = true; }
+    row_begin("Fullscreen", "F11", toggle_w());
+    if (toggle("##fs", &g_settings.fullscreen)) { g_want_fullscreen_apply = true; changed = true; }
+    row_end();
 #endif
     {
-        static const char *const n[] = {"Fill the window", "16:9 with bars"};
+        static const char *const n[] = {"Fill", "16:9"};
         static const int v[] = {ASPECT_UNLOCKED, ASPECT_ORIGINAL};
-        changed |= combo("Shape", &g_settings.aspect, n, v, 2);
+        float w = seg_w(n, 2);
+        row_begin("Shape", MENU_TOUCH ? "Fill the screen, or the Switch's 16:9 with bars." : "Fill the window, or the Switch's 16:9 with bars.", w);
+        changed |= segmented("##shape", &g_settings.aspect, n, v, 2, w);
+        row_end();
     }
-    ImGui::SeparatorText("Image");
+    card_end();
+    card_begin("##image", "IMAGE");
     {
-        static const char *const n[] = {"Match the window", "1080p (1x)", "4K (2x)", "3x", "4x", "Dynamic", "75% of the window",
-                                        "50% of the window", "25% of the window"};
+        static const char *const n[] = {"Match the screen", "1080p (1x)", "4K (2x)", "3x", "4x", "Dynamic", "75% of the screen",
+                                        "50% of the screen", "25% of the screen"};
         static const int v[] = {RES_MATCH, 1, 2, 3, 4, RES_DYNAMIC, RES_Q75, RES_Q50, RES_Q25};
-        if (combo("Resolution", &g_settings.res_mode, n, v, 9)) g_settings.res_auto = false, changed = true;
-        help("What the game is drawn at. The game lays out its screen for 1080p: higher draws it sharper, not smaller.");
+        float w = combo_w(n, 9);
+        row_begin("Resolution", "What the game is drawn at: higher is sharper, not smaller.", w);
+        if (combo("##res", &g_settings.res_mode, n, v, 9, w)) g_settings.res_auto = false, changed = true;
+        row_end();
     }
-    {
+    if (HAVE_METALFX) {
         static const char *const n[] = {"Bilinear", "MetalFX"};
         static const int v[] = {UPSCALE_BILINEAR, UPSCALE_METALFX};
-        if (combo("Upscaler", &g_settings.upscaler, n, v, HAVE_METALFX ? 2 : 1)) g_settings.upscaler_auto = false, changed = true;
-        static const char *const an[] = {"Off", "SMAA"};
-        static const int av[] = {AA_OFF, AA_SMAA};
-        changed |= combo("Anti-aliasing", &g_settings.antialias, an, av, 2);
+        float w = seg_w(n, 2);
+        row_begin("Upscaler", NULL, w);
+        if (segmented("##up", &g_settings.upscaler, n, v, 2, w)) g_settings.upscaler_auto = false, changed = true;
+        row_end();
     }
-    ImGui::SeparatorText("Frame rate");
     {
-        static const char *const n[] = {"The display's refresh rate", "120 fps", "60 fps", "30 fps"};
-        static const int v[] = {0, 120, 60, 30};
-        changed |= combo("Limit", &g_settings.fps_cap, n, v, 4);
-        help("For games that run at the display's rate (Metroid Dread). Animal Crossing runs at 30 fps: frame "
-             "generation shows it at 60 or 120.");
-        static const char *const fn[] = {"Off", "60 fps", "120 fps"};
-        static const int fv[] = {0, 60, 120};
-        changed |= combo("Frame generation", &g_settings.frame_gen, fn, fv, 3);
-        int method = g_settings.frame_gen_flow ? 1 : 0;
-        static const char *const mn[] = {"MetalFX (motion vectors)", "Optical flow"};
-        static const int mv[] = {0, 1};
-        if (HAVE_METALFX && combo("Method", &method, mn, mv, 2)) g_settings.frame_gen_flow = method == 1, changed = true;
-        help("Images between a 30 fps game's frames: smoother motion, the game's speed unchanged, about a display frame "
-             "of latency. MetalFX is cleaner (60 only); optical flow also does 120.");
-        changed |= ImGui::Checkbox("Show the frame rate", &g_settings.show_fps);
+        static const char *const n[] = {"Off", "SMAA"};
+        static const int v[] = {AA_OFF, AA_SMAA};
+        float w = seg_w(n, 2);
+        row_begin("Anti-aliasing", NULL, w);
+        changed |= segmented("##aa", &g_settings.antialias, n, v, 2, w);
+        row_end();
     }
+    card_end();
+    card_begin("##rate", "FRAME RATE");
+    {
+        static const char *const n[] = {"Display", "120", "60", "30"};
+        static const int v[] = {0, 120, 60, 30};
+        float w = seg_w(n, 4);
+        row_begin("Limit", "Metroid Dread runs at the display's rate; Animal Crossing at 30.", w);
+        changed |= segmented("##cap", &g_settings.fps_cap, n, v, 4, w);
+        row_end();
+    }
+    {
+        static const char *const n[] = {"Off", "60", "120"};
+        static const int v[] = {0, 60, 120};
+        float w = seg_w(n, 3);
+        row_begin("Frame generation", "Images between a 30 fps game's frames: smoother motion, a frame of latency.", w);
+        changed |= segmented("##fg", &g_settings.frame_gen, n, v, 3, w);
+        row_end();
+    }
+    if (HAVE_METALFX) {
+        int method = g_settings.frame_gen_flow ? 1 : 0;
+        static const char *const n[] = {"MetalFX", "Optical flow"};
+        static const int v[] = {0, 1};
+        float w = seg_w(n, 2);
+        row_begin("Method", "MetalFX is cleaner (60 only); optical flow also does 120.", w);
+        if (segmented("##fgm", &method, n, v, 2, w)) g_settings.frame_gen_flow = method == 1, changed = true;
+        row_end();
+    }
+    row_begin("Show the frame rate", NULL, toggle_w());
+    changed |= toggle("##fps", &g_settings.show_fps);
+    row_end();
+    card_end();
     if (changed) settings_save();
 }
 
-static void tab_audio(void) {
-    float pct = g_settings.volume * 100;
-    if (ImGui::SliderFloat("Volume", &pct, 0, 100, "%.0f%%")) g_settings.volume = pct / 100, settings_save();
-    if (ImGui::Checkbox("Room reverb", &g_settings.reverb)) settings_save();
-    help("The reverb of rooms and caves, as the game sets it.");
+static void page_audio(void) {
+    card_begin("##audio", NULL);
+    float pct = g_settings.volume * 100, w = em() * 13;
+    row_begin("Volume", NULL, w);
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::SliderFloat("##vol", &pct, 0, 100, "%.0f%%")) g_settings.volume = pct / 100, settings_save();
+    row_end();
+    row_begin("Room reverb", "The echo of rooms and caves, as the game sets it.", toggle_w());
+    if (toggle("##rev", &g_settings.reverb)) settings_save();
+    row_end();
+    card_end();
 }
 
-static void tab_controls(void) {
+static void page_controls(void) {
+    bool changed = false;
+    card_begin("##pad", "CONTROLLER");
+#if MENU_TOUCH
+    help("Pair a controller in Settings > Bluetooth: Xbox, PlayStation, Switch Pro and MFi controllers work.");
+    ImGui::Dummy(ImVec2(0, em() * 0.2f));
+    {
+        static const char *const n[] = {"Auto", "Always", "Never"};
+        static const int v[] = {TOUCH_PAD_AUTO, TOUCH_PAD_ALWAYS, TOUCH_PAD_NEVER};
+        float w = seg_w(n, 3);
+        row_begin("On-screen controller", "Auto: while no controller is connected.", w);
+        changed |= segmented("##touch", &g_settings.touch_pad, n, v, 3, w);
+        row_end();
+    }
+#endif
+    row_begin("Vibration", NULL, toggle_w());
+    changed |= toggle("##rumble", &g_settings.rumble);
+    row_end();
+    {
+        static const char *const n[] = {"Right (A)", "Bottom"};
+        static const int v[] = {MENU_CONFIRM_GAME, MENU_CONFIRM_CONTROLLER};
+        float w = seg_w(n, 2);
+        row_begin("Confirm in this menu", "The button that presses here: the Switch's A, or the controller's own.", w);
+        changed |= segmented("##confirm", &g_settings.menu_confirm, n, v, 2, w);
+        row_end();
+    }
+    card_end();
+    card_begin("##lang", "LANGUAGE");
+    {
+        static int v[N_LANGUAGES];
+        for (int i = 0; i < N_LANGUAGES; i++) v[i] = i;
+        float w = combo_w(g_language_names, N_LANGUAGES);
+        row_begin("Game language", "The system language the game is told (when it restarts).", w);
+        changed |= combo("##language", &g_settings.language, g_language_names, v, N_LANGUAGES, w);
+        row_end();
+    }
+    card_end();
+    card_begin("##keys", "KEYBOARD");
     static const char *const rows[][2] = {
         {"Left stick", "W A S D"}, {"D-pad", "Arrow keys"}, {"A / B / X / Y", "K / J / L / I"}, {"L / R", "Q / E"},
         {"ZL / ZR", "1 / 3"}, {"Plus / Minus", "Enter / Backspace"}, {"Stick clicks", "F / keypad 0"},
         {"Right stick", "Keypad 8 / 5 / 4 / 6"},
     };
-#if MENU_TOUCH
-    help("Play with a controller: pair it in Settings > Bluetooth (Xbox, PlayStation, Switch Pro and MFi controllers). "
-         "A keyboard works too, with these keys (rebind them in nx.ini):");
-#else
-    help("The keyboard's default controls (rebind them in nx.ini). In a game's own text entry the keys type instead.");
-#endif
-    if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        for (auto &r : rows) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(r[0]);
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(r[1]);
-        }
-        ImGui::EndTable();
+    help("Rebind them in nx.ini. In a game's own text entry the keys type instead.");
+    ImGui::Dummy(ImVec2(0, em() * 0.2f));
+    float x1 = ImGui::GetContentRegionAvail().x * 0.45f;
+    for (auto &r : rows) {
+        ImGui::TextUnformatted(r[0]);
+        ImGui::SameLine(x1);
+        ImGui::PushStyleColor(ImGuiCol_Text, C_MUTED);
+        ImGui::TextUnformatted(r[1]);
+        ImGui::PopStyleColor();
     }
-    ImGui::SeparatorText("Controller");
-    bool changed = false;
-#if MENU_TOUCH
-    {
-        static const char *const n[] = {"While no controller is connected", "Always", "Never"};
-        static const int v[] = {TOUCH_PAD_AUTO, TOUCH_PAD_ALWAYS, TOUCH_PAD_NEVER};
-        changed |= combo("On-screen controller", &g_settings.touch_pad, n, v, 3);
-        help("Buttons over the game for playing by touch. Its bottom button is B, as on a Switch.");
-    }
-#endif
-    changed |= ImGui::Checkbox("Vibration", &g_settings.rumble);
-    static const char *const n[] = {"On the right (A, as on a Switch)", "At the bottom"};
-    static const int v[] = {MENU_CONFIRM_GAME, MENU_CONFIRM_CONTROLLER};
-    changed |= combo("Confirm in this menu", &g_settings.menu_confirm, n, v, 2);
-    ImGui::SeparatorText("Language");
-    int lang = g_settings.language;
-    if (ImGui::BeginCombo("Game language", g_language_names[lang < N_LANGUAGES ? lang : 0])) {
-        for (int i = 0; i < N_LANGUAGES; i++)
-            if (ImGui::Selectable(g_language_names[i], i == lang)) g_settings.language = i, changed = true;
-        ImGui::EndCombo();
-    }
-    help("The system language the game is told (it applies when the game restarts).");
+    card_end();
     if (changed) settings_save();
 }
 
@@ -821,7 +1053,11 @@ static void draw_fps(void) {
         if (t0 > 0) fps = (float)((g - g0) / (t - t0)), shown = (float)((s - s0) / (t - t0));
         t0 = t, g0 = g, s0 = s;
     }
-    ImGui::SetNextWindowPos(ImVec2(12 * g_scale, 12 * g_scale));
+    ImVec2 at(12 * g_scale, 12 * g_scale);
+#if MENU_TOUCH
+    if (g_safe[2] > 0) at = ImVec2(g_safe[0] + 12 * g_scale, g_safe[1] + 8 * g_scale);
+#endif
+    ImGui::SetNextWindowPos(at);
     ImGui::SetNextWindowBgAlpha(0.55f);
     ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
@@ -830,102 +1066,294 @@ static void draw_fps(void) {
     ImGui::End();
 }
 
-static void draw_menu(void) {
+// The screen's usable part: inside the safe area on iOS, the whole window elsewhere
+static void usable_rect(ImVec2 *pos, ImVec2 *size) {
     ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImVec2 size(fminf(vp->Size.x * 0.9f, 980 * g_scale), fminf(vp->Size.y * 0.88f, 760 * g_scale));
-    ImVec2 center = vp->GetCenter();
-#if MENU_TOUCH  // (inside the safe area; a phone's short side all of it)
-    if (g_safe[2] > 0) {
-        ImVec2 o(g_safe[0], g_safe[1]), sa(g_safe[2], g_safe[3]);
-        size = ImVec2(fminf(sa.x * 0.96f, 980 * g_scale), fminf(sa.y * 0.94f, 760 * g_scale));
-        center = ImVec2(o.x + sa.x * 0.5f, o.y + sa.y * 0.5f);
-    }
+    *pos = vp->Pos, *size = vp->Size;
+#if MENU_TOUCH
+    if (g_safe[2] > 0) *pos = ImVec2(g_safe[0], g_safe[1]), *size = ImVec2(g_safe[2], g_safe[3]);
 #endif
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
-    bool open = true;
-    ImGui::Begin("nx", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-    if (!open) set_open(false);
-    ImGui::PushItemWidth(ImGui::GetFontSize() * 20);  // (the settings' fields: their labels beside them)
-    // (test) LARECOMP_MENU_TABS_EVERY=<frames>: the next tab every that many frames (screenshots of each)
-    static long every = -1, at;
-    if (every < 0) every = getenv("LARECOMP_MENU_TABS_EVERY") ? atol(getenv("LARECOMP_MENU_TABS_EVERY")) : 0;
-    int want = -1;
-    if (every > 0) { uint64_t g, sh; renderer_frame_counts(&g, &sh); if (!at) at = (long)g; want = (int)(((long)g - at) / every) % 6; }
-    static const char *const names[] = {"Game", "Saves", "Date & time", "Video", "Audio", "Controls"};
-    static void (*const tabs[])(void) = {tab_game, tab_saves, tab_time, tab_video, tab_audio, tab_controls};
-    if (ImGui::BeginTabBar("tabs")) {
-        for (int i = 0; i < 6; i++)
-            if (ImGui::BeginTabItem(names[i], NULL, want == i ? ImGuiTabItemFlags_SetSelected : 0)) {
-                ImGui::BeginChild("##tab", ImVec2(0, 0), ImGuiChildFlags_NavFlattened);  // (scrolls under the tabs, which stay)
-                tabs[i]();
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-        ImGui::EndTabBar();
-    }
-    ImGui::PopItemWidth();
-    ImGui::End();
 }
 
-// The game selection screen: a card for each game (one without its game code in the app can't be picked)
-static void draw_picker(void) {
+static int g_page;
+static void draw_menu(void) {
+    static const char *const names[] = {"Game", "Saves", "Date & time", "Video", "Audio", "Controls"};
+    static void (*const pages[])(void) = {page_game, page_saves, page_time, page_video, page_audio, page_controls};
+    const int n = 6;
+    // (test) LARECOMP_MENU_TABS_EVERY=<frames>: the next page every that many frames (screenshots of each)
+    static long every = -1, at;
+    if (every < 0) every = getenv("LARECOMP_MENU_TABS_EVERY") ? atol(getenv("LARECOMP_MENU_TABS_EVERY")) : 0;
+    if (every > 0) { uint64_t g, sh; renderer_frame_counts(&g, &sh); if (!at) at = (long)g; g_page = (int)(((long)g - at) / every) % n; }
+    if (!g_popup && ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) g_page = (g_page + n - 1) % n;  // (L / R: the pages)
+    if (!g_popup && ImGui::IsKeyPressed(ImGuiKey_GamepadR1)) g_page = (g_page + 1) % n;
+
     ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImVec2 pos = vp->Pos, size = vp->Size;
-#if MENU_TOUCH
-    if (g_safe[2] > 0) pos = ImVec2(g_safe[0], g_safe[1]), size = ImVec2(g_safe[2], g_safe[3]);
-#endif
-    ImGui::SetNextWindowPos(pos);
-    ImGui::SetNextWindowSize(size);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    ImGui::Begin("##games", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(0, 0, 0, 150));
+    ImVec2 up, us;
+    usable_rect(&up, &us);
+    ImVec2 size(fminf(us.x * (MENU_TOUCH ? 0.97f : 0.9f), 1120 * g_scale), fminf(us.y * (MENU_TOUCH ? 0.95f : 0.88f), 780 * g_scale));
+    ImGui::SetNextWindowPos(ImVec2(up.x + us.x * 0.5f, up.y + us.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##nx", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
-    float fs = ImGui::GetFontSize(), cw = fminf(size.x * 0.8f, fs * 30), ch = fs * 4.2f;
-    float total = fs * 4 + g_pick_n * (ch + fs);
-    ImGui::SetCursorPosY(fmaxf(fs, (size.y - total) * 0.5f));
-    ImGui::SetWindowFontScale(1.6f);
-    float tw = ImGui::CalcTextSize("Choose a game").x;
-    ImGui::SetCursorPosX((size.x - tw) * 0.5f);
-    ImGui::TextUnformatted("Choose a game");
-    ImGui::SetWindowFontScale(1);
-    ImGui::Dummy(ImVec2(0, fs));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, fs * 0.6f);
-    bool focused = false;
-    for (int i = 0; i < g_pick_n; i++) {
+    float f = em(), side = fminf(fmaxf(f * 11.5f, size.x * 0.22f), f * 15);
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(wp, ImVec2(wp.x + side, wp.y + size.y), col(C_SIDE), ImGui::GetStyle().WindowRounding,
+                                              ImDrawFlags_RoundCornersLeft);
+    // the pages, down the left
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(f * 0.8f, f * 1.0f));
+    ImGui::BeginChild("##side", ImVec2(side, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_NavFlattened,
+                      ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
+    ImGui::PushFont(g_bold);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted(menu_game_name());
+    ImGui::PopTextWrapPos();
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, f * 0.5f));
+    float bh = ImGui::GetFrameHeight();  // (the pages' buttons share what's left above Resume: a phone's is short)
+    float iw = ImGui::GetContentRegionAvail().x, ih = (ImGui::GetContentRegionAvail().y - bh - f * 1.2f) / n;
+    ih = fminf(fmaxf(ih, f * 1.7f), f * (MENU_TOUCH ? 2.5f : 2.1f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, f * 0.15f));
+    for (int i = 0; i < n; i++) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
         ImGui::PushID(i);
-        ImGui::SetCursorPosX((size.x - cw) * 0.5f);
-        ImVec2 at = ImGui::GetCursorScreenPos();
-        ImGui::BeginDisabled(!g_pick_playable[i]);
-        if (ImGui::Button("##game", ImVec2(cw, ch))) g_picked = i;
-        if (g_pick_playable[i] && !focused) { ImGui::SetItemDefaultFocus(); focused = true; }
-        ImGui::EndDisabled();
-        ImDrawList *dl = ImGui::GetWindowDrawList();  // (the title over the version: two sizes on one button)
-        ImU32 text = ImGui::GetColorU32(g_pick_playable[i] ? ImGuiCol_Text : ImGuiCol_TextDisabled);
-        ImFont *font = ImGui::GetFont();
-        dl->AddText(font, fs * 1.3f, ImVec2(at.x + fs * 1.2f, at.y + ch * 0.5f - fs * 1.35f), text, g_pick_titles[i]);
-        dl->AddText(font, fs, ImVec2(at.x + fs * 1.2f, at.y + ch * 0.5f + fs * 0.2f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
-                    g_pick_details[i]);
-        ImGui::Dummy(ImVec2(0, fs * 0.4f));
+        if (ImGui::InvisibleButton("##page", ImVec2(iw, ih))) g_page = i;
+        bool hov = ImGui::IsItemHovered(), on = i == g_page;
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        if (on) {
+            dl->AddRectFilled(p, ImVec2(p.x + iw, p.y + ih), col(C_ACCENT, 0.16f), ih * 0.3f);
+            dl->AddRectFilled(ImVec2(p.x, p.y + ih * 0.26f), ImVec2(p.x + f * 0.2f, p.y + ih * 0.74f), col(C_ACCENT), f * 0.1f);
+        } else if (hov) dl->AddRectFilled(p, ImVec2(p.x + iw, p.y + ih), IM_COL32(255, 255, 255, 12), ih * 0.3f);
+        ImFont *font = on ? g_bold : ImGui::GetFont();
+        dl->AddText(font, f, ImVec2(p.x + f * 0.85f, p.y + (ih - f) * 0.5f), col(on ? C_ACCENT : C_TEXT), names[i]);
         ImGui::PopID();
     }
     ImGui::PopStyleVar();
+    if (ImGui::GetCursorPosY() < ImGui::GetWindowHeight() - bh - f) ImGui::SetCursorPosY(ImGui::GetWindowHeight() - bh - f);
+    if (button("Resume", true, -FLT_MIN)) set_open(false);
+    ImGui::EndChild();
+    // the page
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(f * 1.3f, f * 1.0f));
+    ImGui::BeginChild("##page", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_NavFlattened);
+    ImGui::PopStyleVar();
+    ImGui::PushFont(g_title);
+    ImGui::TextUnformatted(names[g_page]);
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, f * 0.3f));
+    ImGui::PushID(g_page);
+    pages[g_page]();
+    ImGui::PopID();
+    ImGui::EndChild();
+    // a tap or click outside the panel closes it
+    if (ImGui::IsMouseClicked(0) && !ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByPopup) &&
+        !g_popup && !ImGui::IsPopupOpen(NULL, ImGuiPopupFlags_AnyPopupId)) {
+        ImVec2 m = ImGui::GetIO().MousePos;
+        if (m.x < wp.x || m.y < wp.y || m.x > wp.x + size.x || m.y > wp.y + size.y) set_open(false);
+    }
     ImGui::End();
 }
 
-extern "C" void *ui_metal_layer(void);
-extern "C" void *ui_metal_device(void);
-extern "C" SDL_Window *ui_window(void);
-extern "C" void input_handle_event(const SDL_Event *e);
+// ---- covers (the selection and loading screens): cache/<game>/cover.jpg, a game frame (runtime/nvn/metal.m)
+static NSMutableDictionary<NSString *, id> *g_covers;  // path -> texture, or NSNull (none)
+static id<MTLTexture> cover_texture(const char *path) {
+    if (!path || !path[0] || !g_dev) return nil;
+    if (!g_covers) g_covers = [NSMutableDictionary new];
+    NSString *k = @(path);
+    id t = g_covers[k];
+    if (t) return t == (id)NSNull.null ? nil : (id<MTLTexture>)t;
+    id<MTLTexture> tex = nil;
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:k], NULL);
+    CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+    if (img) {
+        size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+        void *px = calloc(w * h, 4);
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+        tex = [g_dev newTextureWithDescriptor:td];
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
+        CGContextRelease(ctx); CGColorSpaceRelease(cs); free(px); CGImageRelease(img);
+    }
+    if (src) CFRelease(src);
+    g_covers[k] = tex ? (id)tex : (id)NSNull.null;
+    return tex;
+}
+static ImTextureID tex_id(id<MTLTexture> t) { return (ImTextureID)(intptr_t)(__bridge void *)t; }
+// A cover in rect a-b, cropped to fill it (no cover: a gradient in the title's own colour, with its initials)
+static void draw_cover(ImDrawList *dl, ImVec2 a, ImVec2 b, const char *cover, const char *title, float rounding, ImDrawFlags flags,
+                       float dim, bool initials = true) {
+    id<MTLTexture> t = cover_texture(cover);
+    float w = b.x - a.x, h = b.y - a.y;
+    if (t) {
+        float ta = (float)t.width / t.height, ra = w / h;
+        ImVec2 uv0(0, 0), uv1(1, 1);
+        if (ta > ra) { float k = ra / ta; uv0.x = (1 - k) * 0.5f, uv1.x = 1 - uv0.x; }
+        else { float k = ta / ra; uv0.y = (1 - k) * 0.5f, uv1.y = 1 - uv0.y; }
+        int v = (int)(255 * (1 - dim));
+        dl->AddImageRounded(tex_id(t), a, b, uv0, uv1, IM_COL32(v, v, v, 255), rounding, flags);
+        return;
+    }
+    unsigned hsh = 5381;
+    for (const char *c = title; *c; c++) hsh = hsh * 33 + (unsigned char)*c;
+    float r, g, bl;
+    ImGui::ColorConvertHSVtoRGB((hsh % 360) / 360.0f, 0.55f, 0.42f * (1 - dim), r, g, bl);
+    dl->AddRectFilled(a, b, col(ImVec4(r, g, bl, 1)), rounding, flags);
+    dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + h * 0.5f), b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 110),
+                                IM_COL32(0, 0, 0, 110));
+    if (!initials) return;
+    char ini[8] = {0};
+    int k = 0;
+    for (const char *c = title; *c && k < 2; c++)
+        if ((c == title || c[-1] == ' ') && ((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z'))) ini[k++] = *c;
+    float sz = fminf(h * 0.42f, g_title->FontSize * 2.4f);
+    ImVec2 ts = g_title->CalcTextSizeA(sz, FLT_MAX, 0, ini);
+    dl->AddText(g_title, sz, ImVec2(a.x + (w - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f), IM_COL32(255, 255, 255, 220), ini);
+}
+
+// The game selection screen: a card for each game, its cover over its name (one without its code in the app can't be
+// picked)
+static const char *const *g_pick_covers;
+static void draw_picker(void) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImDrawList *bg = ImGui::GetBackgroundDrawList();
+    bg->AddRectFilledMultiColor(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(18, 22, 28, 255),
+                                IM_COL32(18, 22, 28, 255), IM_COL32(6, 7, 9, 255), IM_COL32(6, 7, 9, 255));
+    ImVec2 pos, size;
+    usable_rect(&pos, &size);
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##games", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleColor();
+    float f = em(), gap = f * 1.4f;
+    int n = g_pick_n;
+    float cw = fminf(f * 19, (size.x - gap * (n + 1)) / n), ih = cw * 9 / 16, chh = ih + f * 3.6f;
+    float total_h = g_title->FontSize + f * 1.6f + chh;
+    float y0 = fmaxf(f, (size.y - total_h) * 0.5f);
+    const char *head = "Choose a game";
+    ImVec2 hs = g_title->CalcTextSizeA(g_title->FontSize, FLT_MAX, 0, head);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddText(g_title, g_title->FontSize, ImVec2(pos.x + (size.x - hs.x) * 0.5f, pos.y + y0), col(C_TEXT), head);
+    float x0 = (size.x - (n * cw + (n - 1) * gap)) * 0.5f, cy = y0 + g_title->FontSize + f * 1.6f, rr = f * 0.9f;
+    bool focused = false;
+    for (int i = 0; i < n; i++) {
+        ImGui::SetCursorPos(ImVec2(x0 + i * (cw + gap), cy));
+        ImGui::PushID(i);
+        ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + cw, a.y + chh);
+        ImGui::BeginDisabled(!g_pick_playable[i]);
+        if (ImGui::InvisibleButton("##game", ImVec2(cw, chh))) g_picked = i;
+        if (g_pick_playable[i] && !focused) { ImGui::SetItemDefaultFocus(); focused = true; }
+        bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+        ImGui::EndDisabled();
+        dl->AddRectFilled(a, b, col(C_CARD), rr);
+        draw_cover(dl, a, ImVec2(b.x, a.y + ih), g_pick_covers ? g_pick_covers[i] : NULL, g_pick_titles[i], rr,
+                   ImDrawFlags_RoundCornersTop, g_pick_playable[i] ? 0 : 0.6f);
+        ImGui::PushClipRect(a, b, true);
+        dl->AddText(g_bold, f * 1.15f, ImVec2(a.x + f * 0.9f, a.y + ih + f * 0.7f), col(g_pick_playable[i] ? C_TEXT : C_MUTED), g_pick_titles[i]);
+        dl->AddText(g_small, g_small->FontSize, ImVec2(a.x + f * 0.9f, a.y + ih + f * 2.1f), col(C_MUTED), g_pick_details[i]);
+        ImGui::PopClipRect();
+        if (hot && g_pick_playable[i]) dl->AddRect(a, b, col(C_ACCENT), rr, 0, f * 0.18f);
+        ImGui::PopID();
+    }
+    const char *tip = MENU_TOUCH ? "Tap a game to play it, or choose it with a controller." : "Click a game to play it, or choose it with a controller.";
+    ImVec2 tsz = g_small->CalcTextSizeA(g_small->FontSize, FLT_MAX, 0, tip);
+    dl->AddText(g_small, g_small->FontSize, ImVec2(pos.x + (size.x - tsz.x) * 0.5f, pos.y + cy + chh + f * 1.4f), col(C_MUTED), tip);
+    ImGui::End();
+}
+
+// ---- the loading screen: from a game's pick to its first frame, its cover dimmed behind its name and a spinner
+static pthread_t g_loading_thread;
+static char g_loading_title[160], g_loading_cover[1100], g_loading_text[200];
+static std::mutex g_loading_mx;  // (the status text: set from any thread)
+static double g_loading_t0;
+static void draw_loading(void) {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+    dl->AddRectFilled(a, b, IM_COL32(6, 7, 9, 255));
+    double t = CACurrentMediaTime() - g_loading_t0;
+    float in = (float)fmin(t / 0.6, 1);  // (a fade in)
+    draw_cover(dl, a, b, g_loading_cover, g_loading_title, 0, 0, 1 - 0.38f * in, false);
+    dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + vp->Size.y * 0.45f), b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+                                IM_COL32(0, 0, 0, 200), IM_COL32(0, 0, 0, 200));
+    float f = em(), cx = a.x + vp->Size.x * 0.5f, cy = a.y + vp->Size.y * 0.5f;
+    ImVec2 ts = g_title->CalcTextSizeA(g_title->FontSize, FLT_MAX, 0, g_loading_title);
+    dl->AddText(g_title, g_title->FontSize, ImVec2(cx - ts.x * 0.5f, cy - ts.y - f * 1.2f), col(C_TEXT, in), g_loading_title);
+    float r = f * 1.1f, th = f * 0.22f, sy = cy + f * 0.9f;
+    dl->AddCircle(ImVec2(cx, sy), r, IM_COL32(255, 255, 255, (int)(40 * in)), 48, th);
+    float a0 = (float)fmod(t * 4.2, 2 * M_PI), len = 1.6f + 0.9f * (float)sin(t * 2.1);
+    dl->PathArcTo(ImVec2(cx, sy), r, a0, a0 + len, 32);
+    dl->PathStroke(col(C_ACCENT, in), 0, th);
+    char text[200];
+    { std::lock_guard<std::mutex> lk(g_loading_mx); snprintf(text, sizeof text, "%s", g_loading_text); }
+    ImVec2 ss = g_small->CalcTextSizeA(g_small->FontSize, FLT_MAX, 0, text);
+    dl->AddText(g_small, g_small->FontSize, ImVec2(cx - ss.x * 0.5f, sy + r + f * 1.1f), col(C_MUTED, in), text);
+}
+static void *loading_main(void *arg) {
+    (void)arg;
+    pthread_setname_np("nx loading screen");
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    while (!g_loading_stop) {
+        @autoreleasepool {
+            id<CAMetalDrawable> d = [layer nextDrawable];
+            if (!d) continue;
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = d.texture;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            menu_render(dev, cb, d.texture);
+            [cb presentDrawable:d];
+            [cb commit];
+            [cb waitUntilScheduled];
+        }
+    }
+    return NULL;
+}
+extern "C" void menu_loading_status(const char *status) {
+    std::lock_guard<std::mutex> lk(g_loading_mx);
+    snprintf(g_loading_text, sizeof g_loading_text, "%s", status ? status : "");
+}
+extern "C" void menu_loading_begin(const char *title, const char *cover) {
+    if (g_loading || !ui_metal_layer()) return;
+    snprintf(g_loading_title, sizeof g_loading_title, "%s", title ? title : "");
+    snprintf(g_loading_cover, sizeof g_loading_cover, "%s", cover ? cover : "");
+    menu_loading_status("Loading");
+    int pw, ph;  // (the main thread's: the layer's size before the game's loop sets it)
+    SDL_GetWindowSizeInPixels(ui_window(), &pw, &ph);
+    ((__bridge CAMetalLayer *)ui_metal_layer()).drawableSize = CGSizeMake(pw, ph);
+    g_loading_t0 = CACurrentMediaTime();
+    g_loading_stop = false;
+    g_loading = true;
+    if (pthread_create(&g_loading_thread, NULL, loading_main, NULL)) g_loading = false;
+}
+extern "C" void menu_loading_end(void) {
+    if (!g_loading) return;
+    if (const char *e = getenv("LARECOMP_LOADING_HOLD"))  // (tests) the loading screen stays at least that many seconds
+        while (CACurrentMediaTime() - g_loading_t0 < atof(e)) usleep(20000);
+    g_loading_stop = true;
+    pthread_join(g_loading_thread, NULL);
+    g_loading = false;
+    fprintf(stderr, "[menu] loading screen: %.1f s\n", CACurrentMediaTime() - g_loading_t0);
+}
 
 // (main thread, before a game boots: no game draws) the selection screen until a game is picked; its index
-extern "C" int menu_pick_game(int n, const char *const titles[], const char *const details[], const bool playable[]) {
+extern "C" int menu_pick_game(int n, const char *const titles[], const char *const details[], const char *const covers[],
+                              const bool playable[]) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
     SDL_Window *w = ui_window();
     id<MTLCommandQueue> q = [dev newCommandQueue];
-    g_pick_n = n, g_pick_titles = titles, g_pick_details = details, g_pick_playable = playable, g_picked = -1;
+    g_pick_n = n, g_pick_titles = titles, g_pick_details = details, g_pick_covers = covers, g_pick_playable = playable, g_picked = -1;
     g_picking = true;
     const char *auto_pick = getenv("LARECOMP_PICK_GAME");  // (tests) that game's index, after that many frames: "1@120"
     int auto_k = -1, auto_at = 0, frame = 0;
@@ -1009,10 +1437,11 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
         if (g_open && getenv("LARECOMP_MENU_CLOSE_MS") && (CACurrentMediaTime() - opened) * 1000 > atof(getenv("LARECOMP_MENU_CLOSE_MS")))
             set_open(false);
     }
-    bool open = g_open, fps = g_settings.show_fps;
-    if (!open && !fps && !MENU_TOUCH && !g_picking) return;
+    bool open = g_open, fps = g_settings.show_fps, loading = g_loading;
+    if (!open && !fps && !MENU_TOUCH && !g_picking && !loading) return;
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     ensure_context();
+    g_dev = dev;
     ImGuiIO &io = ImGui::GetIO();
     float scale = fmaxf(1.0f, roundf(target.height / 900.0f * 4) / 4);
 #if MENU_TOUCH  // (in points: a phone's 15, an iPad's 18 - the same size whatever the screen's pixels)
@@ -1044,11 +1473,12 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
     ImGui_ImplMetal_NewFrame(rp);
     ImGui::NewFrame();
     g_popup = false;
-    if (g_picking) draw_picker();
+    if (loading) draw_loading();
+    else if (g_picking) draw_picker();
     else if (open) draw_menu();
-    if (fps && !g_picking) draw_fps();
+    if (fps && !g_picking && !loading) draw_fps();
 #if MENU_TOUCH
-    if (!open && !g_picking) draw_menu_button(target.width);
+    if (!open && !g_picking && !loading) draw_menu_button(target.width);
 #endif
     g_text_input = io.WantTextInput;
     ImGui::Render();
@@ -1071,6 +1501,9 @@ static std::atomic<bool> g_want_fullscreen_apply{true};
 extern "C" {
 const char *larecomp_version(void) { return DREADRECOMP_VERSION; }
 bool menu_is_open(void) { return false; }
+void menu_loading_begin(const char *title, const char *cover) { (void)title, (void)cover; }
+void menu_loading_status(const char *status) { (void)status; }
+void menu_loading_end(void) {}
 bool menu_input_captured(void) { return false; }
 bool menu_pauses_game(void) { return false; }
 void menu_test_open(void) {}

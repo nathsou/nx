@@ -314,7 +314,7 @@ IOS_LIBS := $(foreach g,$(IOS_GAMES),$(APP)/Frameworks/$(g)/game.dylib)
 # A device (IOS_SDK=iphoneos): IOS_PROFILE=<.mobileprovision for dev.dreadrecomp.nx> (Xcode makes one: docs/ios.md),
 # IOS_SIGN=<signing identity, default the first "Apple Development" one>; signed with the profile's entitlements.
 IOS_SIGN ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Apple Development" | awk '{print $$2}')
-ios-app: $(EXE) $(APP)/Info.plist $(APP)/DejaVuSans.ttf $(IOS_LIBS)
+ios-app: $(EXE) $(APP)/Info.plist $(APP)/DejaVuSans.ttf $(APP)/DejaVuSans-Bold.ttf $(IOS_LIBS)
 	@for f in $(APP)/Frameworks/*/game.dylib; do case " $(IOS_LIBS) " in *" $$f "*) ;; *) echo "removing $$f"; rm -rf "$$(dirname $$f)";; esac; done
 ifeq ($(IOS_SDK),iphoneos)
 	@[ -n "$(IOS_PROFILE)" ] || { echo "IOS_PROFILE=<provisioning profile> needed to sign for a device (docs/ios.md)"; exit 1; }
@@ -334,7 +334,7 @@ $(APP)/Info.plist: tools/ios/Info.plist Makefile
 	@mkdir -p $(dir $@)
 	sed -e 's/@PLATFORM@/$(if $(filter iphonesimulator,$(IOS_SDK)),iPhoneSimulator,iPhoneOS)/' -e 's/@IOS_MIN@/$(IOS_MIN)/' $< > $@
 	plutil -convert binary1 $@
-$(APP)/DejaVuSans.ttf: third_party/fonts/DejaVu/DejaVuSans.ttf
+$(APP)/DejaVuSans.ttf $(APP)/DejaVuSans-Bold.ttf: $(APP)/%: third_party/fonts/DejaVu/%
 	@mkdir -p $(dir $@)
 	cp $< $@
 $(APP)/Frameworks/%/game.dylib: $(B)/%/game.dylib

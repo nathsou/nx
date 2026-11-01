@@ -19,6 +19,7 @@
 #include "settings.h"
 #include "hle.h"
 #include "kernel.h"
+#include "ui/menu.h"
 
 const char *g_romfs_dir;
 
@@ -180,8 +181,12 @@ static void boot(const char *root) {
     }
 #endif
     char why[512];
+    uint64_t t0 = plat_now_ns();
     if (!game_select(root, why, sizeof why)) FATAL("%s\n", why);  // (its profile, if any: game.h)
+    menu_loading_status("Loading the game's code");
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
+    uint64_t t1 = plat_now_ns();
+    menu_loading_status("Loading the game");
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
     kernel_init();
@@ -200,6 +205,9 @@ static void boot(const char *root) {
         fclose(f);
     }
     LOG("main thread: prio %d, core %d, stack 0x%x\n", prio, core, stack_size);
+    LOG("[boot] game code loaded in %llu ms, the game in %llu ms\n", (unsigned long long)((t1 - t0) / 1000000),
+        (unsigned long long)((plat_now_ns() - t1) / 1000000));
+    menu_loading_status("Starting");
 
     if (g_game.profile && g_game.profile->booted) g_game.profile->booted();
     if (getenv("LARECOMP_WATCH_EARLY")) { extern void watch_arm(void); watch_arm(); }  // (debug: the watch from boot)
@@ -265,8 +273,8 @@ static const char *pick_game(void) {
         FATAL("No game files found. Put the game's folder (with exefs/ and romfs/ in it) in nx's folder in the "
               "Files app (On My iPhone / iPad > nx), then start nx again.\n");
     if (g_game_count == 1) return g_games[0];
-    static char titles[16][160], details[16][200];
-    const char *t[16], *dt[16];
+    static char titles[16][160], details[16][200], covers[16][600];
+    const char *t[16], *dt[16], *cv[16];
     bool playable[16];
     for (int i = 0; i < g_game_count; i++) {
         GameInfo g;
@@ -277,14 +285,24 @@ static const char *pick_game(void) {
         if (!playable[i]) snprintf(details[i], sizeof details[i], "%s - this app doesn't have its game code", folder);
         else snprintf(details[i], sizeof details[i], "%s%s%s", g.version ? "Version " : "", g.version ? g.version->label : "",
                       g.version ? "" : folder);
-        t[i] = titles[i], dt[i] = details[i];
+        snprintf(covers[i], sizeof covers[i], "cache/%s/cover.jpg", g.key);
+        t[i] = titles[i], dt[i] = details[i], cv[i] = covers[i];
     }
     extern void ui_window_init(void);
-    extern int menu_pick_game(int n, const char *const titles[], const char *const details[], const bool playable[]);
     ui_window_init();
-    int k = menu_pick_game(g_game_count, t, dt, playable);
+    int k = menu_pick_game(g_game_count, t, dt, cv, playable);
     LOG("[boot] game picked: %s\n", g_games[k]);
     return g_games[k];
+}
+// The loading screen until the game's first frame (runtime/ui/menu.mm): its name over its cover
+static void loading_screen(const char *root) {
+    GameInfo g;
+    char why[256], cover[600];
+    if (!game_identify(root, &g, why, sizeof why)) return;
+    extern void ui_window_init(void);
+    ui_window_init();
+    snprintf(cover, sizeof cover, "cache/%s/cover.jpg", g.key);
+    menu_loading_begin(g.name, cover);
 }
 #endif
 
@@ -316,6 +334,9 @@ int main(int argc, char **argv) {
     if (!given) root = pick_game();
 #endif
     for (;;) {  // (an in-place reboot boots again; "back to the start screen": the game selection screen on iOS)
+#if TARGET_OS_IPHONE
+        loading_screen(root);
+#endif
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
