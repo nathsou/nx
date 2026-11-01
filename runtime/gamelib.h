@@ -69,7 +69,8 @@ typedef const GameLibTables *(*GameLibEntry)(void);
 extern "C" {
 #endif
 
-// Loads the game code for the game files in game_dir (once; later calls return the first result). Looks at
+// Loads the game code for the game files in game_dir (once per game_dir: later calls for it return the first result;
+// another game_dir loads its own). Looks at
 // LARECOMP_GAME_LIB, then <dir>/game.<dylib|so|dll> in each folder next to the executable (a source checkout's
 // build/<game>/: the one whose id matches), then game_dir. false: why says what's wrong.
 bool gamelib_load(const char *game_dir, char *why, size_t why_size);

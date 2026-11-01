@@ -632,10 +632,17 @@ static void cidx_save(void) {
 }
 
 static void cidx_build(const char *romfs) {
-    if (cidx_n) return;
+    if (cidx_n && !strcmp(croot, romfs)) return;
+    if (cidx_n) {  // (another game - the iOS app's selection screen: its own index)
+        for (int i = 0; i < ncfiles; i++) free(cfiles[i].rel), free(cfiles[i].mem);
+        free(cfiles), cfiles = NULL, ncfiles = 0;
+        cidx_n = 0;
+    }
     snprintf(croot, sizeof croot, "%s", romfs);
     double t0 = (double)clock() / CLOCKS_PER_SEC;
     bool cached = cidx_load();
+    extern void menu_loading_status(const char *status);  // (runtime/ui/menu.mm: the loading screen)
+    if (!cached) menu_loading_status("Finding the game's shaders (the first time only)");
     if (!cached) cidx_walk("", 0);
     qsort(cidx, cidx_n, sizeof *cidx, cent_cmp);
     if (!cached) cidx_save();
@@ -878,7 +885,10 @@ void shader_prep_boot(const char *romfs) {
     const char *e = getenv("LARECOMP_SHADER_PREP");
     bool only = getenv("LARECOMP_SHADER_PREP_ONLY") != NULL;
     if (e && !atoi(e) && !only) return;
+    extern void menu_loading_status(const char *status);
+    menu_loading_status("Preparing the game's shaders");
     shader_prep_run(romfs, NULL, NULL);
+    menu_loading_status("Starting");
     if (only) {
         extern void renderer_archive_flush(void);
         renderer_archive_flush();
