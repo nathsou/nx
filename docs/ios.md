@@ -2,8 +2,9 @@
 
 The same engine runs on iOS and iPadOS: the Metal renderer and the games' code built for the device, in one app
 (`nx.app`) that can hold several games (`Frameworks/<game>/game.dylib`). The game files, saves and settings live in
-the app's Documents folder, which the Files app shows ("On My iPhone / iPad > nx"). Tested: Metroid Dread and Animal
-Crossing: New Horizons on an iPhone 17 Pro (iOS 27), and in the iOS Simulator (iPhone 18 Pro, iPad Pro 13-inch).
+the app's Documents folder, which the Files app shows ("On My iPhone / iPad > nx"). Tested: Metroid Dread on an iPhone 17 Pro
+(iOS 27) and in the iOS Simulator (iPhone 18 Pro, iPad Pro 13-inch); Animal Crossing: New Horizons is in the same app
+but hasn't been played on a device yet (the Simulator can't run it: see the end).
 
 ## Building (on a Mac, Xcode installed)
 
@@ -34,7 +35,8 @@ minutes for Dread, longer for Animal Crossing.
 
 4. Copy each game's folder (`exefs/` and `romfs/`) into the app's Documents: the Files app, Finder's file sharing, or
    `xcrun devicectl device copy to --device <id> --domain-type appDataContainer --domain-identifier dev.dreadrecomp.nx
-   --source data/dread/romfs --destination Documents/dread/romfs` (and the same for `exefs`).
+   --source data/dread/romfs --destination Documents/dread/romfs` (and the same for `exefs`). A copy over USB tends to fail
+   after some 17,000 files: copy a big romfs (Animal Crossing's has 67,000) one folder at a time.
 
 **A free Apple account is enough on recent iPhones.** The guest's address window at `0x7000000000` (runtime/rt.h)
 fits in the address space an app gets on an iPhone 17 Pro with iOS 27 (up to `0x7fc0000000`, measured), so the
