@@ -226,13 +226,16 @@ static void sched_acquire(KThread *t) {
     if (c->owner && c->owner->prio > t->prio) c->owner->sched_preempt = true;  // more urgent: the holder yields
     uint64_t t0 = plat_now_ns();
     bool forced = false;
+    // (each waiter on its own condition, signalled when it's due: a release used to wake every waiter of the core, and
+    // each also woke every 5 ms to look - thousands of wake-ups a second in Animal Crossing. The timeout stays, longer,
+    // for what changes the order without a release: a priority change)
     while (!(c->owner == NULL && sched_best(c) == t) && !g_rt_unwind) {
         if (plat_now_ns() - t0 > 1000000000ull) { forced = true; break; }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 5000000;
+        ts.tv_nsec += 20000000;
         if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
-        pthread_cond_timedwait(&c->cv, &c->m, &ts);
+        pthread_cond_timedwait(&t->sched_cond, &c->m, &ts);
     }
     for (int i = 0; i < c->nw; i++)
         if (c->waiters[i] == t) { c->waiters[i] = c->waiters[--c->nw]; break; }
@@ -254,10 +257,13 @@ static void sched_release(KThread *t) {
     if (!t || t->sched_core < 0) return;
     CoreSched *c = &g_cs[t->sched_core];
     pthread_mutex_lock(&c->m);
-    if (getenv("LARECOMP_LOG_SCHED") && t->handle == 0x116) LOG("[sched] %#x releases core %d (owner %#x)\n", t->handle, t->sched_core, c->owner ? c->owner->handle : 0);
+    static int log_sched = -1;  // (LARECOMP_LOG_SCHED: one thread's core releases)
+    if (log_sched < 0) log_sched = getenv("LARECOMP_LOG_SCHED") != NULL;
+    if (log_sched && t->handle == 0x116) LOG("[sched] %#x releases core %d (owner %#x)\n", t->handle, t->sched_core, c->owner ? c->owner->handle : 0);
     if (c->owner == t) c->owner = NULL;
     t->sched_core = -1;
-    pthread_cond_broadcast(&c->cv);
+    KThread *next = c->owner ? NULL : sched_best(c);  // (the waiter due next, alone)
+    if (next) pthread_cond_signal(&next->sched_cond);
     pthread_mutex_unlock(&c->m);
 }
 
@@ -420,6 +426,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     if (core == -2) core = g_default_core;
     t->affinity = core >= 0 && core < 4 ? 1ull << core : 0xF;
     pthread_cond_init(&t->cond, NULL);
+    pthread_cond_init(&t->sched_cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = prio;

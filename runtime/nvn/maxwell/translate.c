@@ -2800,6 +2800,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 r++;
             }
         }
+        if (getenv("LARECOMP_FS_SANITIZE"))  // (debug) float outputs made finite: NaN -> 0, +-inf -> +-65504 (a half's limit)
+            for (int rt = 0; rt < 8; rt++)
+                if (((c->omap_target >> (rt * 4)) & 0xF) && !(key && key->rt_kind[rt]))
+                    sp(&s, "  o.c%d = select(clamp(o.c%d, -65504.0f, 65504.0f), float4(0), isnan(o.c%d));\n", rt, rt, rt);
         if (tint)
             sp(&s, "  if (ltint[0].w > 0.0f) { float3 g = o.c0.rgb; float l = dot(g, float3(0.299f, 0.587f, 0.114f));\n"
                    "    o.c0.rgb = mix(g, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n");
