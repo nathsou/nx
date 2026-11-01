@@ -4568,7 +4568,11 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         static id<MTLSamplerState> dnear;
         if (!dnear) dnear = [dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
         id<MTLTexture> sdepth = s;
-        if (s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || s.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8)
+        if (s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8
+#if !TARGET_OS_IPHONE
+            || s.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8
+#endif
+           )
             sdepth = [s newTextureViewWithPixelFormat:s.pixelFormat];
         float r[4] = {(float)sx0 / s.width, (float)sy0 / s.height, (float)sw / s.width, (float)sh / s.height};
         [e setRenderPipelineState:pipe];

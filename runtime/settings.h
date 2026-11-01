@@ -15,6 +15,7 @@ enum { AA_OFF = 0, AA_SMAA = 1 };
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3 };
 // Which face button confirms in our own menus (runtime/ui/pad_nav.mm); the game's input is never affected
 enum { MENU_CONFIRM_GAME = 0, MENU_CONFIRM_CONTROLLER = 1 };
+enum { TOUCH_PAD_AUTO = 0 /* while no controller is connected */, TOUCH_PAD_ALWAYS = 1, TOUCH_PAD_NEVER = 2 };
 enum { TIMER_POS_LEFT = 0, TIMER_POS_RIGHT = 1 };  // the run timer's corner (bottom left / right)
 enum { CHAOS_LETTERS_OFF = 0, CHAOS_LETTERS_EXPLORED = 1, CHAOS_LETTERS_MAP = 2 /* explored, all with the Map */ };
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
@@ -36,6 +37,7 @@ typedef struct {
     bool frame_gen_flow;  // frame generation by optical flow only ("flow"); default "metalfx": MetalFX's, with motion vectors, at 60
     int fps_cap;         // frame rate limit for games that run at the display's rate (Dread): 0 the display's, else 120 / 60 / 30
     bool menu_pause;     // the game pauses while the in-game menu is open (runtime/ui/menu.mm)
+    int touch_pad;       // TOUCH_PAD_*: iOS's on-screen controller (runtime/ui/touch_pad.mm)
     long long time_offset;  // seconds the game's clock runs from this Mac's (Date & time: runtime/services/time.c)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect

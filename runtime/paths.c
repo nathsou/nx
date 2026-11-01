@@ -15,6 +15,9 @@
 #include <sys/statvfs.h>
 #include <utime.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "gamelib.h"
 #include "paths.h"
@@ -133,6 +136,11 @@ static void default_home(char *root, size_t n) {
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
     if (xdg && *xdg == '/') snprintf(root, n, "%s/lasrecomp", xdg);
     else snprintf(root, n, "%s/.local/share/lasrecomp", home && *home ? home : "/tmp");
+#elif TARGET_OS_IPHONE
+    // the app's Documents folder (HOME: its data container), which the Files app shows: the player puts the game
+    // files there (Documents/<game>/exefs, romfs), and finds the saves and settings
+    const char *home = getenv("HOME");
+    snprintf(root, n, "%s/Documents", home && *home ? home : "/tmp");
 #else
     const char *home = getenv("HOME");
     snprintf(root, n, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");

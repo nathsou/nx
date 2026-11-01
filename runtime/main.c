@@ -1,6 +1,14 @@
 // Entry: identify the game, load its modules and recompiled code, set up the kernel, run nn::init::Start on the main
 // thread.
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if TARGET_OS_IPHONE  // (UIKit: SDL runs main inside the app's UIApplicationMain)
+#include <SDL3/SDL_main.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -254,6 +262,22 @@ int main(int argc, char **argv) {
         root = realpath(argv[i], arg_root) ? arg_root : argv[i];  // (relative to where we started)
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#if TARGET_OS_IPHONE
+    // the game files: a folder in the data folder (the app's Documents) with exefs/main in it, unless given
+    if (!strcmp(root, ".")) {
+        DIR *d = opendir(".");
+        struct stat st;
+        char p[1100];
+        for (struct dirent *e; d && (e = readdir(d));) {
+            snprintf(p, sizeof p, "%s/exefs/main", e->d_name);
+            if (e->d_name[0] != '.' && stat(p, &st) == 0 && realpath(e->d_name, arg_root)) { root = arg_root; break; }
+        }
+        if (d) closedir(d);
+        if (!strcmp(root, "."))
+            FATAL("No game files found. Put the game's folder (with exefs/ and romfs/ in it) in nx's folder in the "
+                  "Files app (On My iPhone / iPad > nx), then start nx again.\n");
+    }
+#endif
     for (;;) {  // (an in-place reboot boots again; "back to the start screen" too, as there is none yet)
         boot(root);
         ui_run();  // window and input on the main thread; returns when a reboot is requested

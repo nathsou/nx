@@ -4,10 +4,20 @@
 // restored by restarting the game), the game's date and time, video, audio, controls. Settings go to nx.ini at once.
 // The menu is built and drawn on the render thread (menu_render, after the game image), input reaches it from the
 // window's event loop on the main thread (menu_handle_event): one lock between the two.
+// iOS / iPadOS (MENU_TOUCH): the menu button at the top of the screen opens it; a tap presses, a drag up or down
+// scrolls, a drag sideways moves a slider; sized in points for fingers, inside the screen's safe area.
 #include "menu.h"
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#define MENU_TOUCH 1
+#else
 #import <Cocoa/Cocoa.h>
+#define MENU_TOUCH 0
+#endif
+#define HAVE_METALFX (!TARGET_OS_SIMULATOR)  // (the iOS Simulator has no MetalFX: renderer bilinear / optical flow)
 #import <Metal/Metal.h>
 #include <SDL3/SDL.h>
 
@@ -15,6 +25,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <atomic>
 #include <ctime>
 #include <filesystem>
@@ -39,6 +51,7 @@ extern const char *g_save_dir;  // runtime/services/fs.c: save/<game>
 void rt_request_reboot(int kind);
 int rt_reboot_requested(void);
 void input_reset(void);
+void input_touch_tap(bool plus);       // runtime/hle/input.c
 int64_t time_game_now(void);           // runtime/services/time.c
 void time_offset_changed(void);
 void renderer_frame_counts(uint64_t *game, uint64_t *shown);  // runtime/nvn/metal.m
@@ -53,6 +66,17 @@ static std::atomic<bool> g_popup{false};       // a confirmation is up: Esc clos
 static std::recursive_mutex g_mx;              // ImGui's context: built on the render thread, fed on the main thread
 static float g_density = 1;                    // window pixels per point (main thread: mouse positions are in points)
 static bool g_pad_back, g_pad_start;           // (Minus + Plus held together: the menu)
+#if MENU_TOUCH
+// (main thread) the window in pixels, its safe area (clear of the notch / Dynamic Island / home bar), the finger the
+// menu follows; (render thread -> main) where the menu button is and the font's size, in pixels
+static int g_win_w = 1, g_win_h = 1;
+static std::atomic<float> g_safe[4] = {0, 0, 0, 0};  // x, y, w, h (pixels; w = 0: the whole window)
+static std::atomic<float> g_button[4] = {0, 0, 0, 0};  // (the menu's; Minus / Plus left / right of it, as wide, when
+static std::atomic<float> g_button_gap{0};              //  the on-screen controller is up: g_button_gap apart)
+static std::atomic<bool> g_pad_buttons{false};
+static std::atomic<float> g_font_px{17};
+static struct { SDL_FingerID id; bool down, pressed, scrolling; float x0, y0, x, y; } g_touch;
+#endif
 
 extern "C" {
 
@@ -162,6 +186,64 @@ extern "C" bool menu_handle_event(const SDL_Event *e) {
         if (down && g_pad_back && g_pad_start) { set_open(!open); return true; }
         if (open && down && e->gbutton.button == SDL_GAMEPAD_BUTTON_START && !g_popup) { set_open(false); return true; }
     }
+#if MENU_TOUCH
+    if (e->type == SDL_EVENT_FINGER_DOWN || e->type == SDL_EVENT_FINGER_MOTION || e->type == SDL_EVENT_FINGER_UP ||
+        e->type == SDL_EVENT_FINGER_CANCELED) {
+        float x = e->tfinger.x * g_win_w, y = e->tfinger.y * g_win_h;
+        static int log_touch = -1;  // LARECOMP_LOG_TOUCH=1: every finger event
+        if (log_touch < 0) log_touch = getenv("LARECOMP_LOG_TOUCH") != NULL;
+        if (log_touch)
+            fprintf(stderr, "[menu] finger %#x %llx at %.0f,%.0f (window %dx%d, button %.0f,%.0f-%.0f,%.0f)\n", e->type,
+                    (unsigned long long)e->tfinger.fingerID, x, y, g_win_w, g_win_h, (float)g_button[0], (float)g_button[1],
+                    (float)g_button[2], (float)g_button[3]);
+        if (!open) {  // (the game takes no touches: only the menu button's, and Minus / Plus beside it)
+            float pad = g_font_px * 0.5f, w = g_button[2] - g_button[0], step = w + g_button_gap;
+            if (e->type != SDL_EVENT_FINGER_DOWN || y < g_button[1] - pad || y > g_button[3] + pad) return true;
+            if (x >= g_button[0] - pad && x <= g_button[2] + pad) set_open(true);
+            else if (g_pad_buttons && x >= g_button[0] - step - pad && x < g_button[0] - pad) input_touch_tap(false);
+            else if (g_pad_buttons && x > g_button[2] + pad && x <= g_button[2] + step + pad) input_touch_tap(true);
+            return true;
+        }
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        ensure_context();
+        ImGuiIO &io = ImGui::GetIO();
+        float slop = g_font_px * 0.6f;
+        if (e->type == SDL_EVENT_FINGER_DOWN) {  // (one finger at a time: the first)
+            if (g_touch.down) return true;
+            g_touch = {e->tfinger.fingerID, true, false, false, x, y, x, y};
+            io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+            io.AddMousePosEvent(x, y);
+            return true;
+        }
+        if (!g_touch.down || e->tfinger.fingerID != g_touch.id) return true;
+        if (e->type == SDL_EVENT_FINGER_MOTION) {
+            float dx = x - g_touch.x0, dy = y - g_touch.y0;
+            if (!g_touch.pressed && !g_touch.scrolling) {
+                if (fabsf(dy) > slop && fabsf(dy) >= fabsf(dx)) g_touch.scrolling = true;  // up / down: scrolls
+                else if (fabsf(dx) > slop) {  // sideways: a press that follows the finger (sliders)
+                    g_touch.pressed = true;
+                    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+                    io.AddMousePosEvent(g_touch.x0, g_touch.y0);
+                    io.AddMouseButtonEvent(0, true);
+                }
+            }
+            io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+            if (g_touch.scrolling) io.AddMouseWheelEvent(0, (y - g_touch.y) / (5 * g_font_px));  // (ImGui: 5 lines a notch)
+            else if (g_touch.pressed) io.AddMousePosEvent(x, y);
+            g_touch.x = x, g_touch.y = y;
+            return true;
+        }
+        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+        if (e->type == SDL_EVENT_FINGER_UP && !g_touch.pressed && !g_touch.scrolling) {  // a tap: a click where it began
+            io.AddMousePosEvent(g_touch.x0, g_touch.y0);
+            io.AddMouseButtonEvent(0, true);
+            io.AddMouseButtonEvent(0, false);
+        } else if (g_touch.pressed) io.AddMouseButtonEvent(0, false);
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);  // (no finger: nothing hovered)
+        g_touch.down = false;
+        return true;
+    }
+#endif
     if (!open) return false;
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     ensure_context();
@@ -216,6 +298,16 @@ extern "C" void menu_apply_window_requests(void *win) {
         SDL_SetWindowSize(w, (int)(r >> 16), (int)(r & 0xffff));
     float d = SDL_GetWindowPixelDensity(w);
     if (d > 0) g_density = d;
+#if MENU_TOUCH
+    touch_pad_update(g_open);
+    g_pad_buttons = touch_pad_shown();
+    SDL_GetWindowSizeInPixels(w, &g_win_w, &g_win_h);
+    SDL_Rect sa;
+    if (SDL_GetWindowSafeArea(w, &sa)) {  // (points)
+        float k = g_density;
+        g_safe[0] = sa.x * k, g_safe[1] = sa.y * k, g_safe[2] = sa.w * k, g_safe[3] = sa.h * k;
+    }
+#endif
     bool text = g_open && g_text_input;  // (SDL sends typed text only between Start / StopTextInput)
     if (text != SDL_TextInputActive(w)) {
         if (text) SDL_StartTextInput(w);
@@ -328,6 +420,11 @@ static void setup_style(float scale) {
     ImGui::StyleColorsDark();
     st.WindowRounding = 10, st.FrameRounding = 6, st.GrabRounding = 6, st.TabRounding = 6, st.PopupRounding = 8;
     st.WindowPadding = ImVec2(18, 14), st.FramePadding = ImVec2(10, 6), st.ItemSpacing = ImVec2(10, 8);
+#if MENU_TOUCH  // (fingers: taller rows and scroll bars, a margin around what can be touched)
+    st.FramePadding = ImVec2(14, 11), st.ItemSpacing = ImVec2(12, 10), st.ItemInnerSpacing = ImVec2(10, 6);
+    st.ScrollbarSize = 22, st.GrabMinSize = 26, st.TouchExtraPadding = ImVec2(4, 4), st.TabBarBorderSize = 2;
+    st.WindowPadding = ImVec2(20, 16);
+#endif
     ImVec4 *c = st.Colors;
     c[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.11f, 0.96f);
     c[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.14f, 0.98f);
@@ -406,8 +503,10 @@ static void tab_game(void) {
     if (ImGui::Button("Resume")) set_open(false);
     ImGui::SameLine();
     if (ImGui::Button("Restart game")) ImGui::OpenPopup("Restart?");
+#if !MENU_TOUCH  // (an iOS app doesn't quit itself: the app switcher closes it)
     ImGui::SameLine();
     if (ImGui::Button("Quit")) ImGui::OpenPopup("Quit?");
+#endif
     if (confirm("Restart?", "Restart the game? Progress since the game last saved is lost.", "Restart")) {
         set_open(false);
         rt_request_reboot(REBOOT_GAME);
@@ -420,7 +519,12 @@ static void tab_game(void) {
     ImGui::Spacing();
     ImGui::SeparatorText("Menu");
     if (ImGui::Checkbox("Pause the game while this menu is open", &g_settings.menu_pause)) settings_save();
+#if MENU_TOUCH
+    help("Open this menu with the button at the top of the screen, or Minus and Plus together on a controller "
+         "(F1 or Esc on a keyboard).");
+#else
     help("Open and close this menu with F1 or Esc, or Minus and Plus together on a controller.");
+#endif
 }
 
 static void tab_saves(void) {
@@ -442,10 +546,21 @@ static void tab_saves(void) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
     ImGui::TextWrapped("%s", root.c_str());
     ImGui::PopStyleColor();
+#if MENU_TOUCH
+    if (ImGui::Button("Show in the Files app")) {  // (shareddocuments://<path>: the Files app, at that folder)
+        NSString *path = @(root.c_str());
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSURL *u = [NSURL URLWithString:[@"shareddocuments://" stringByAppendingString:
+                                             [path stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet]]];
+            [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
+        });
+    }
+#else
     if (ImGui::Button("Open the saves folder")) {
         NSString *path = @(root.c_str());
         dispatch_async(dispatch_get_main_queue(), ^{ [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]]; });
     }
+#endif
     ImGui::SeparatorText("Backups");
     static char label[64];
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
@@ -506,7 +621,7 @@ static void tab_time(void) {
          "reads it when it starts, as on a Switch: restart the game after changing it. It treats a jump as time travel.");
     ImGui::Spacing();
     bool custom = g_settings.time_offset != 0;
-    if (ImGui::RadioButton("This Mac's date and time", !custom) && custom) {
+    if (ImGui::RadioButton(MENU_TOUCH ? "This device's date and time" : "This Mac's date and time", !custom) && custom) {
         g_settings.time_offset = 0;
         settings_save();
         time_offset_changed();
@@ -560,8 +675,10 @@ static void tab_time(void) {
 
 static void tab_video(void) {
     bool changed = false;
-    ImGui::SeparatorText("Window");
+    ImGui::SeparatorText(MENU_TOUCH ? "Screen" : "Window");
+#if !MENU_TOUCH
     if (ImGui::Checkbox("Fullscreen (F11)", &g_settings.fullscreen)) { g_want_fullscreen_apply = true; changed = true; }
+#endif
     {
         static const char *const n[] = {"Fill the window", "16:9 with bars"};
         static const int v[] = {ASPECT_UNLOCKED, ASPECT_ORIGINAL};
@@ -578,7 +695,7 @@ static void tab_video(void) {
     {
         static const char *const n[] = {"Bilinear", "MetalFX"};
         static const int v[] = {UPSCALE_BILINEAR, UPSCALE_METALFX};
-        if (combo("Upscaler", &g_settings.upscaler, n, v, 2)) g_settings.upscaler_auto = false, changed = true;
+        if (combo("Upscaler", &g_settings.upscaler, n, v, HAVE_METALFX ? 2 : 1)) g_settings.upscaler_auto = false, changed = true;
         static const char *const an[] = {"Off", "SMAA"};
         static const int av[] = {AA_OFF, AA_SMAA};
         changed |= combo("Anti-aliasing", &g_settings.antialias, an, av, 2);
@@ -596,7 +713,7 @@ static void tab_video(void) {
         int method = g_settings.frame_gen_flow ? 1 : 0;
         static const char *const mn[] = {"MetalFX (motion vectors)", "Optical flow"};
         static const int mv[] = {0, 1};
-        if (combo("Method", &method, mn, mv, 2)) g_settings.frame_gen_flow = method == 1, changed = true;
+        if (HAVE_METALFX && combo("Method", &method, mn, mv, 2)) g_settings.frame_gen_flow = method == 1, changed = true;
         help("Images between a 30 fps game's frames: smoother motion, the game's speed unchanged, about a display frame "
              "of latency. MetalFX is cleaner (60 only); optical flow also does 120.");
         changed |= ImGui::Checkbox("Show the frame rate", &g_settings.show_fps);
@@ -617,7 +734,12 @@ static void tab_controls(void) {
         {"ZL / ZR", "1 / 3"}, {"Plus / Minus", "Enter / Backspace"}, {"Stick clicks", "F / keypad 0"},
         {"Right stick", "Keypad 8 / 5 / 4 / 6"},
     };
+#if MENU_TOUCH
+    help("Play with a controller: pair it in Settings > Bluetooth (Xbox, PlayStation, Switch Pro and MFi controllers). "
+         "A keyboard works too, with these keys (rebind them in nx.ini):");
+#else
     help("The keyboard's default controls (rebind them in nx.ini). In a game's own text entry the keys type instead.");
+#endif
     if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
         for (auto &r : rows) {
             ImGui::TableNextRow();
@@ -627,7 +749,16 @@ static void tab_controls(void) {
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Controller");
-    bool changed = ImGui::Checkbox("Vibration", &g_settings.rumble);
+    bool changed = false;
+#if MENU_TOUCH
+    {
+        static const char *const n[] = {"While no controller is connected", "Always", "Never"};
+        static const int v[] = {TOUCH_PAD_AUTO, TOUCH_PAD_ALWAYS, TOUCH_PAD_NEVER};
+        changed |= combo("On-screen controller", &g_settings.touch_pad, n, v, 3);
+        help("Buttons over the game for playing by touch. Its bottom button is B, as on a Switch.");
+    }
+#endif
+    changed |= ImGui::Checkbox("Vibration", &g_settings.rumble);
     static const char *const n[] = {"On the right (A, as on a Switch)", "At the bottom"};
     static const int v[] = {MENU_CONFIRM_GAME, MENU_CONFIRM_CONTROLLER};
     changed |= combo("Confirm in this menu", &g_settings.menu_confirm, n, v, 2);
@@ -665,7 +796,15 @@ static void draw_fps(void) {
 static void draw_menu(void) {
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImVec2 size(fminf(vp->Size.x * 0.9f, 980 * g_scale), fminf(vp->Size.y * 0.88f, 760 * g_scale));
-    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImVec2 center = vp->GetCenter();
+#if MENU_TOUCH  // (inside the safe area; a phone's short side all of it)
+    if (g_safe[2] > 0) {
+        ImVec2 o(g_safe[0], g_safe[1]), sa(g_safe[2], g_safe[3]);
+        size = ImVec2(fminf(sa.x * 0.96f, 980 * g_scale), fminf(sa.y * 0.94f, 760 * g_scale));
+        center = ImVec2(o.x + sa.x * 0.5f, o.y + sa.y * 0.5f);
+    }
+#endif
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     bool open = true;
     ImGui::Begin("nx", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
@@ -680,12 +819,40 @@ static void draw_menu(void) {
     static void (*const tabs[])(void) = {tab_game, tab_saves, tab_time, tab_video, tab_audio, tab_controls};
     if (ImGui::BeginTabBar("tabs")) {
         for (int i = 0; i < 6; i++)
-            if (ImGui::BeginTabItem(names[i], NULL, want == i ? ImGuiTabItemFlags_SetSelected : 0)) { tabs[i](); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(names[i], NULL, want == i ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("##tab", ImVec2(0, 0), ImGuiChildFlags_NavFlattened);  // (scrolls under the tabs, which stay)
+                tabs[i]();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
         ImGui::EndTabBar();
     }
     ImGui::PopItemWidth();
     ImGui::End();
 }
+
+#if MENU_TOUCH
+// The menu button, at the top of the screen in the middle (clear of a game's corners), faint over the game
+static void draw_menu_button(float width) {
+    float w = 44 * g_density, h = 30 * g_density, top = fmaxf((float)g_safe[1], 6 * g_density), gap = 14 * g_density;
+    ImVec2 a(width * 0.5f - w * 0.5f, top), b(a.x + w, a.y + h);
+    g_button[0] = a.x, g_button[1] = a.y, g_button[2] = b.x, g_button[3] = b.y, g_button_gap = gap;
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImU32 bg = IM_COL32(20, 22, 26, 90), fg = IM_COL32(235, 240, 245, 150);
+    float lw = w * 0.42f, t = fmaxf(1.5f * g_density, 1), cx = (a.x + b.x) * 0.5f, cy = (a.y + b.y) * 0.5f;
+    dl->AddRectFilled(a, b, bg, h * 0.5f);
+    for (int i = -1; i <= 1; i++)
+        dl->AddLine(ImVec2(cx - lw * 0.5f, cy + i * h * 0.2f), ImVec2(cx + lw * 0.5f, cy + i * h * 0.2f), fg, t);
+    if (!g_pad_buttons) return;
+    for (int side = -1; side <= 1; side += 2) {  // Minus, Plus (the on-screen controller has neither)
+        float x = cx + side * (w + gap);
+        dl->AddRectFilled(ImVec2(x - w * 0.5f, a.y), ImVec2(x + w * 0.5f, b.y), bg, h * 0.5f);
+        float r = h * 0.22f;
+        dl->AddLine(ImVec2(x - r, cy), ImVec2(x + r, cy), fg, t * 1.4f);
+        if (side > 0) dl->AddLine(ImVec2(x, cy - r), ImVec2(x, cy + r), fg, t * 1.4f);
+    }
+}
+#endif
 
 extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     {   // (tests) LARECOMP_MENU_TEST_TIME=<seconds>: the clock moved that far while open; LARECOMP_MENU_CLOSE_MS=<ms>: closed
@@ -704,11 +871,15 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
             set_open(false);
     }
     bool open = g_open, fps = g_settings.show_fps;
-    if (!open && !fps) return;
+    if (!open && !fps && !MENU_TOUCH) return;
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     ensure_context();
     ImGuiIO &io = ImGui::GetIO();
     float scale = fmaxf(1.0f, roundf(target.height / 900.0f * 4) / 4);
+#if MENU_TOUCH  // (in points: a phone's 15, an iPad's 18 - the same size whatever the screen's pixels)
+    float points = target.height / fmaxf(g_density, 1);
+    scale = roundf(g_density * (points < 600 ? 0.9f : 1.05f) * 4) / 4;
+#endif
     if (!g_inited || scale != g_scale) {
         if (g_inited) ImGui_ImplMetal_DestroyFontsTexture();
         setup_fonts(scale);
@@ -717,6 +888,9 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
         else ImGui_ImplMetal_CreateFontsTexture(dev);
         g_inited = true;
         g_scale = scale;
+#if MENU_TOUCH
+        g_font_px = 17.0f * scale;
+#endif
     }
     static double last;
     double now = CACurrentMediaTime();
@@ -733,6 +907,9 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
     g_popup = false;
     if (open) draw_menu();
     if (fps) draw_fps();
+#if MENU_TOUCH
+    if (!open) draw_menu_button(target.width);
+#endif
     g_text_input = io.WantTextInput;
     ImGui::Render();
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];

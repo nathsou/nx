@@ -5,14 +5,27 @@
 # macOS: Homebrew clang/SDL3/FFmpeg, Metal renderer.
 # Windows: MSYS2 UCRT64 shell (see docs/BUILD-windows.md), clang + Vulkan renderer.
 # Linux: clang + Vulkan renderer, x86-64 or aarch64 (see docs/linux.md).
+# iOS / iPadOS: `make ios GAME=<name>` on a Mac (Xcode; tools/build_deps_ios.sh first), Metal renderer (see docs/ios.md).
 UNAME := $(shell uname -s)
 comma := ,
-ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
+ifeq ($(PLATFORM),ios)
+else ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
 PLATFORM := windows
 else ifeq ($(UNAME),Linux)
 PLATFORM := linux
 else
 PLATFORM := macos
+endif
+
+# iOS: IOS_SDK iphonesimulator (default) or iphoneos, IOS_MIN the oldest iOS to run on; Xcode's clang for that SDK.
+# The platform layer is macOS's (runtime/platform/macos.c, with TARGET_OS_IPHONE parts).
+ifeq ($(PLATFORM),ios)
+IOS_SDK  ?= iphonesimulator
+IOS_MIN  ?= 17.0
+IOS_TARGET := arm64-apple-ios$(IOS_MIN)$(if $(filter iphonesimulator,$(IOS_SDK)),-simulator)
+B        := build/$(IOS_SDK)
+DEPS     ?= build/deps-$(IOS_SDK)
+PLATFORM_SRC := macos
 endif
 
 # GAME: the game to generate / build (its files in GAME_DIR, default data/<GAME>: exefs/ and romfs/ from extract.mts)
@@ -42,8 +55,8 @@ B         ?= build
 MACOS_MIN ?=
 DEPS      ?=
 MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
-CC       := clang $(MINFLAG) $(CROSS)
-CXX      := clang++ $(MINFLAG) $(CROSS)
+CC       := $(if $(IOS_SDK),xcrun -sdk $(IOS_SDK) clang -target $(IOS_TARGET),clang $(MINFLAG) $(CROSS))
+CXX      := $(if $(IOS_SDK),xcrun -sdk $(IOS_SDK) clang++ -target $(IOS_TARGET),clang++ $(MINFLAG) $(CROSS))
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
@@ -56,7 +69,7 @@ GB       := $(B)/$(GAME)
 GEN_OBJ  := $(patsubst %.c,$(GB)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(GB)/obj/tools/gamelib_entry.o
 # The engine, and every game profile (games/<id>/*.c: they register themselves, runtime/game.h)
 RT_SRC   := $(wildcard runtime/*.c runtime/*.cpp) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
-            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c \
+            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(or $(PLATFORM_SRC),$(PLATFORM)).c \
             $(wildcard games/*/*.c)
 RT_HDRS  := $(wildcard runtime/*.h games/*/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
@@ -65,7 +78,22 @@ UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
 IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
              $(B)/imgui/imgui_impl_sdl3.o
 
-ifeq ($(PLATFORM),macos)
+ifeq ($(PLATFORM),ios)
+APP      := $(B)/nx.app
+EXE      := $(APP)/nx
+DEPINC   := -I$(DEPS)/include
+LDFLAGS  := -L$(DEPS)/lib -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd -lbz2 -lz -liconv \
+            $(addprefix -framework ,CoreFoundation Foundation Metal QuartzCore UIKit ImageIO CoreGraphics \
+              UniformTypeIdentifiers CoreMedia CoreVideo CoreAudio AudioToolbox AVFoundation CoreBluetooth CoreMotion \
+              GameController CoreText OpenGLES $(if $(filter iphoneos,$(IOS_SDK)),MetalFX)) -weak_framework CoreHaptics -Wl,-rpath,@executable_path/Frameworks
+BACKEND_SRC := $(wildcard runtime/nvn/*.m)
+BACKEND_OBJ := $(patsubst runtime/%.m,$(B)/rt/%.o,$(BACKEND_SRC))
+IMGUI_OBJ += $(B)/imgui/imgui_impl_metal.o
+UIFLAGS  := -fobjc-arc
+# the game code: a library in the app (Frameworks/), linked against the app's own runtime functions
+GAMELIB  := $(GB)/game.dylib
+GAMELIB_LDFLAGS := -dynamiclib -Wl,-undefined,dynamic_lookup -install_name @rpath/game.dylib
+else ifeq ($(PLATFORM),macos)
 SDL      := $(or $(DEPS),/opt/homebrew/opt/sdl3)
 FFMPEG   := $(or $(DEPS),/opt/homebrew/opt/ffmpeg)
 ZSTD     := $(or $(DEPS),/opt/homebrew/opt/zstd)
@@ -209,6 +237,7 @@ $(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
 	@mkdir -p $(dir $@)link
 	$(CXX) -o $(dir $@)link/$(notdir $@) $^ $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
+	@rmdir $(dir $@)link 2>/dev/null || true
 
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
 $(GAMELIB): $(GEN_OBJ) | $(EXE)
@@ -266,3 +295,32 @@ corpus: build/shader_corpus $(EXE)
 	@rc=0; [ -n "$(SKIP_CHECK)" ] || build/shader_corpus $(GAME_DIR)/romfs $(CORPUS_ARGS) || rc=$$?; \
 	LARECOMP_SHADER_PREP_ONLY=1 LARECOMP_NO_LAUNCHER=1 LARECOMP_NO_AUDIO=1 $(EXE) $(GAME_DIR) && exit $$rc
 .PHONY: corpus
+
+# ---- iOS / iPadOS (docs/ios.md): `make ios GAME=<name>` builds build/<sdk>/nx.app with that game's code in it
+# (Frameworks/game.dylib); `make ios-run` installs it in the booted Simulator and starts it there.
+ios:
+	$(MAKE) PLATFORM=ios ios-app
+ios-run:
+	$(MAKE) PLATFORM=ios ios-install
+ifeq ($(PLATFORM),ios)
+ios-app: $(EXE) $(APP)/Info.plist $(APP)/DejaVuSans.ttf $(if $(GEN_SRC),$(APP)/Frameworks/game.dylib)
+	codesign -f -s - $(if $(GEN_SRC),$(APP)/Frameworks/game.dylib) $(APP) 2>&1 | grep -v "replacing existing signature" || true
+	@echo "$(APP)"
+$(APP)/Info.plist: tools/ios/Info.plist Makefile
+	@mkdir -p $(dir $@)
+	sed -e 's/@PLATFORM@/$(if $(filter iphonesimulator,$(IOS_SDK)),iPhoneSimulator,iPhoneOS)/' -e 's/@IOS_MIN@/$(IOS_MIN)/' $< > $@
+	plutil -convert binary1 $@
+$(APP)/DejaVuSans.ttf: third_party/fonts/DejaVu/DejaVuSans.ttf
+	@mkdir -p $(dir $@)
+	cp $< $@
+$(APP)/Frameworks/game.dylib: $(GAMELIB)
+	@mkdir -p $(dir $@)
+	cp $< $@ && cp $<.id $@.id
+# (the Simulator: the game files go in the app's Documents folder - a link to $(GAME_DIR), not a 4 GB copy)
+ios-install: ios-app
+	xcrun simctl install booted $(APP)
+	@docs=$$(xcrun simctl get_app_container booted dev.dreadrecomp.nx data) && mkdir -p "$$docs/Documents" && \
+	    [ -e "$$docs/Documents/$(GAME)" ] || ln -s "$(abspath $(GAME_DIR))" "$$docs/Documents/$(GAME)"
+	xcrun simctl launch --console-pty booted dev.dreadrecomp.nx
+endif
+.PHONY: ios ios-run ios-app ios-install

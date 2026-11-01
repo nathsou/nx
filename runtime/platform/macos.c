@@ -1,12 +1,21 @@
-// macOS host layer (runtime/platform.h).
+// macOS host layer (runtime/platform.h), and iOS / iPadOS's (TARGET_OS_IPHONE: the same kernel and libraries, minus
+// what an app there can't do - start processes, show an alert from C - and its log always in the data folder).
 #include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
 #include <crt_externs.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#if !TARGET_OS_IPHONE
 #include <mach/mach_vm.h>
+#else
+#include <mach/vm_map.h>
+#define mach_vm_address_t vm_address_t
+#define mach_vm_allocate vm_allocate
+#endif
 #include <mach/thread_policy.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -25,6 +34,9 @@
 #include "../paths.h"
 #include "../platform.h"
 #include "posix_log.h"
+#if TARGET_OS_IPHONE
+#include <SDL3/SDL_messagebox.h>
+#endif
 
 void rt_crash_explain(char *out, size_t n, const char *log_path);  // runtime/crash_explain.c
 
@@ -38,7 +50,12 @@ static char g_log_path[1024];
 static void log_to_file_in_app(void) {
     char exe[1024];
     uint32_t sz = sizeof exe;
+#if TARGET_OS_IPHONE  // (an app there has no terminal; the Simulator's console: LARECOMP_LOG_STDERR=1)
+    (void)exe, (void)sz;
+    if (getenv("LARECOMP_LOG_STDERR")) return;
+#else
     if (isatty(STDERR_FILENO) || _NSGetExecutablePath(exe, &sz) != 0 || !strstr(exe, ".app/Contents/MacOS/")) return;
+#endif
     char dir[900];
     if (!rt_data_root_early(dir, sizeof dir)) return;  // (runtime/paths.h: the data folder, wherever it was moved)
     mkdir(dir, 0755);
@@ -62,7 +79,16 @@ void plat_system_info(PlatSysInfo *si) {
     struct utsname u;
     if (uname(&u) == 0) snprintf(machine, sizeof machine, "%s", u.machine);
     bool rosetta = sysctl_int("sysctl.proc_translated") == 1;
+#if TARGET_OS_SIMULATOR
+    snprintf(si->os, sizeof si->os, "iOS Simulator %s (%s)", ver[0] ? ver : "?", machine);
+    (void)rosetta;
+#elif TARGET_OS_IPHONE
+    sysctl_str("hw.machine", machine, sizeof machine);  // (the model: iPhone17,1)
+    snprintf(si->os, sizeof si->os, "iOS %s (%s)", ver[0] ? ver : "?", machine);
+    (void)rosetta;
+#else
     snprintf(si->os, sizeof si->os, "macOS %s (%s%s)", ver[0] ? ver : "?", machine, rosetta ? ", Rosetta" : "");
+#endif
     sysctl_str("machdep.cpu.brand_string", si->cpu, sizeof si->cpu);
     si->cores = (int)sysctl_int("hw.physicalcpu");
     si->threads = (int)sysctl_int("hw.logicalcpu");
@@ -72,6 +98,9 @@ void plat_system_info(PlatSysInfo *si) {
     char exe[1024];
     uint32_t sz = sizeof exe;
     si->package = _NSGetExecutablePath(exe, &sz) == 0 && strstr(exe, ".app/Contents/MacOS/") ? ".app" : NULL;
+#if TARGET_OS_IPHONE
+    si->package = NULL;
+#endif
 }
 
 void plat_init(void) {
@@ -166,6 +195,11 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 void plat_exec(char *const argv[]) {
+#if TARGET_OS_IPHONE  // (an app can't start a process: the caller reports the failure)
+    (void)argv;
+    errno = ENOTSUP;
+    return;
+#endif
     if (argv) { execv(argv[0], argv); return; }
     char path[4096];
     if (plat_exe_path(path, sizeof path)) execv(path, *_NSGetArgv());
@@ -192,17 +226,25 @@ void plat_fatal_notice(void) {
     rt_crash_explain(text, sizeof text, g_log_path);
     if (!g_log_path[0]) return;
     fflush(stderr);
+#if TARGET_OS_IPHONE  // (no CFUserNotification: an SDL message box, shown from the main thread's run loop)
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "nx", text, NULL);
+#else
     CFStringRef msg = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
     CFUserNotificationDisplayAlert(0, kCFUserNotificationStopAlertLevel, NULL, NULL, NULL, CFSTR("nx"), msg,
                                    CFSTR("OK"), NULL, NULL, NULL);
     if (msg) CFRelease(msg);
+#endif
 }
 
 static void *notice_thread(void *text) {
+#if TARGET_OS_IPHONE
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "nx", text, NULL);
+#else
     CFStringRef msg = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
     CFUserNotificationDisplayAlert(0, kCFUserNotificationCautionAlertLevel, NULL, NULL, NULL, CFSTR("nx"), msg,
                                    CFSTR("OK"), NULL, NULL, NULL);
     if (msg) CFRelease(msg);
+#endif
     free(text);
     return NULL;
 }
@@ -255,6 +297,10 @@ void plat_crash_handler_install(void) {
 extern char **environ;
 
 PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+#if TARGET_OS_IPHONE  // (no child processes on iOS)
+    (void)argv, (void)log_path, (void)append_log;
+    return 0;
+#endif
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 1, log_path ? log_path : "/dev/null",
