@@ -99,11 +99,12 @@ on an iPhone signed with a free Apple account. See [docs/ios.md](docs/ios.md).
 
 ## Settings and the menu
 
-Press **F1** or **Esc** (or **Minus + Plus** together on a controller) for the in-game menu. The game pauses under it
+Press **F1** or **Esc** (or **Home**, or **Minus + Plus** together, on a controller) for the in-game menu. The game pauses under it
 and its sound is muted (Game tab: uncheck the option to keep it running). Changes apply at once and are saved to
 `nx.ini` in the repository folder.
 
-- **Game**: resume, restart the game, quit.
+- **Game**: resume, restart the game, quit; the *game speed* (0.5x to 3x): the game's clock, frames and sound run that
+  much faster or slower (the sound higher or lower). Above 1x the machine has to draw the extra frames.
 - **Saves**: the current save, backups, restoring one (see [Saves](#saves)).
 - **Date & time**: the clock the game sees - this Mac's, or a date and time of your own (Animal Crossing's seasons,
   shops and events follow it). Animal Crossing reads it when it starts, as on a Switch: the tab has a button to

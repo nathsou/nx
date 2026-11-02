@@ -1101,7 +1101,9 @@ static void *renderer_tick(void *arg) {
     int st_min = 1 << 30, st_dry = 0;
     while (!r->quit) {
         if (r->stream) {
-            while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
+            // (the game speed: the device takes the queue that much faster - as much more of it ahead)
+            double sp = rt_speed() > 1 ? rt_speed() : 1;
+            while (SDL_GetAudioStreamQueued(r->stream) >= (int)(target * sp) && !r->quit) {
                 struct timespec ts = {0, 1000000};
                 nanosleep(&ts, NULL);
             }
@@ -1135,7 +1137,13 @@ static void *renderer_tick(void *arg) {
             memset(out, 0, frame_bytes);
         }
         pthread_mutex_unlock(&r->lock);
-        if (r->stream) { apply_gain(r->stream); SDL_PutAudioStreamData(r->stream, out, frame_bytes); }
+        if (r->stream) {
+            apply_gain(r->stream);
+            // the game speed: the sound plays at it (higher or lower), so the game's audio keeps time with its clock
+            float ratio = (float)rt_speed();
+            if (SDL_GetAudioStreamFrequencyRatio(r->stream) != ratio) SDL_SetAudioStreamFrequencyRatio(r->stream, ratio);
+            SDL_PutAudioStreamData(r->stream, out, frame_bytes);
+        }
         if (r->wav && r->state == 0) {
             fwrite(out, 1, frame_bytes, r->wav);
             r->wav_bytes += frame_bytes;
@@ -1153,8 +1161,9 @@ static void *renderer_tick(void *arg) {
         static int burst = -1;
         if (burst < 0) burst = getenv("LARECOMP_AUDIO_BURST") != NULL;
         if (r->stream && r->state == 0 && !burst) {
-            uint64_t until = plat_now_ns() + (uint64_t)N * 1000000000ull / r->sample_rate;
-            while (r->updates == updates && !r->quit && plat_now_ns() < until && SDL_GetAudioStreamQueued(r->stream) > low) {
+            uint64_t until = plat_now_ns() + (uint64_t)((double)N * 1e9 / r->sample_rate / rt_speed());
+            int low_sp = (int)(low * (rt_speed() > 1 ? rt_speed() : 1));
+            while (r->updates == updates && !r->quit && plat_now_ns() < until && SDL_GetAudioStreamQueued(r->stream) > low_sp) {
                 struct timespec ts = {0, 200000};
                 nanosleep(&ts, NULL);
             }

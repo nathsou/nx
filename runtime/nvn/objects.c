@@ -55,7 +55,7 @@ NVN(nvnDeviceFinalize) { (void)c; }
 NVN(nvnDeviceSetDebugLabel) { (void)c; }
 NVN(nvnDeviceGetInteger) { *(int32_t *)AP(2) = (int32_t)device_integer((uint32_t)A(1)); }
 NVN(nvnDeviceGetCurrentTimestampInNanoseconds) {
-    RET(plat_now_ns());
+    RET(rt_game_ns());
 }
 NVN(nvnDeviceGetTimestampInNanoseconds) {  // counter.timestamp: Switch GPU ticks (614.4 MHz, as the counters are written)
     RET((uint64_t)((unsigned __int128)G(uint64_t, A(1), 8) * 625 / 384));
@@ -905,7 +905,7 @@ static void present_wait(int interval) {
     g_present_interval = uncapped ? 0 : interval;
     if (uncapped && !getenv("LARECOMP_UNCAPPED")) limit_wait();
     if (uncapped || interval < 1) return;
-    const uint64_t vsync = 16666667;
+    const uint64_t vsync = (uint64_t)(16666667 / rt_speed());  // (the game's 60 Hz, at its speed)
     static uint64_t due;  // when this frame may be shown (the last one's + its interval)
     uint64_t now = plat_now_ns();
     if (due > now) {

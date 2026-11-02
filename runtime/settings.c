@@ -38,6 +38,7 @@ Settings g_settings = {
     .menu_confirm = MENU_CONFIRM_CONTROLLER,
     .show_fps = false,
     .menu_pause = true,
+    .speed = 1,
     .inv_keys = true,
     .tracker = true,
     .tracker_filters = -1,
@@ -173,6 +174,7 @@ void settings_load(void) {
         else if (!strcmp(key, "frame_rate_limit")) { int v = atoi(val); g_settings.fps_cap = v == 30 || v == 60 || v == 120 ? v : 0; }
         else if (!strcmp(key, "pause_in_menu")) g_settings.menu_pause = atoi(val) != 0;
         else if (!strcmp(key, "touch_controller")) g_settings.touch_pad = atoi(val);
+        else if (!strcmp(key, "game_speed")) g_settings.speed = (float)atof(val);
         else if (!strcmp(key, "time_offset")) g_settings.time_offset = atoll(val);
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
@@ -242,7 +244,8 @@ void settings_save(void) {
     if (g_settings.fps_cap) fprintf(f, "frame_rate_limit = %d\n", g_settings.fps_cap);
     else fprintf(f, "frame_rate_limit = display\n");
     fprintf(f, "pause_in_menu = %d\n", g_settings.menu_pause);
-    fprintf(f, "touch_controller = %d\n", g_settings.touch_pad);  // (iOS: 0 without a controller, 1 always, 2 never)
+    fprintf(f, "touch_controller = %d\n", g_settings.touch_pad);
+    fprintf(f, "game_speed = %g\n", g_settings.speed);  // (1: as on a Switch)  // (iOS: 0 without a controller, 1 always, 2 never)
     fprintf(f, "time_offset = %lld\n", g_settings.time_offset);
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);

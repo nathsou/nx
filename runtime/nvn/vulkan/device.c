@@ -1126,6 +1126,7 @@ static void present_hooks(void) {
     total_frames++;
     g_frame_counter++;
     pace_frame();  // (pace.c: the game's 30 fps mode when frames don't fit 60)
+    rt_speed_frame();  // (the game speed setting: runtime/kernel.c)
     extern void input_frame(uint64_t frame);
     input_frame(total_frames);
     static long slow_ms = -1;  // LARECOMP_SIM_SLOW_FRAME_MS=<ms>: sleep per presented frame (simulate a slow machine)

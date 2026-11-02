@@ -38,6 +38,7 @@ typedef struct {
     int fps_cap;         // frame rate limit for games that run at the display's rate (Dread): 0 the display's, else 120 / 60 / 30
     bool menu_pause;     // the game pauses while the in-game menu is open (runtime/ui/menu.mm)
     int touch_pad;       // TOUCH_PAD_*: iOS's on-screen controller (runtime/ui/touch_pad.mm)
+    float speed;         // the game's speed: 1 as on a Switch, 0.5 half, 2 twice (runtime/kernel.c rt_game_ns)
     long long time_offset;  // seconds the game's clock runs from this Mac's (Date & time: runtime/services/time.c)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect

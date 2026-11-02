@@ -7,6 +7,8 @@
 #include "hle.h"
 #include "kernel.h"
 #include "game.h"
+#include "settings.h"
+#include <stdatomic.h>
 #ifdef _WIN32
 #include "platform/windows_threads.h"
 #endif
@@ -108,16 +110,55 @@ void kernel_signal(KObject *o) {
 
 // ------------------------------------------------------------------ time
 
-uint64_t rt_ticks(void) {
-    // 19.2 MHz system tick
-    uint64_t ns = plat_now_ns();
-    static double scale = -1;
-    if (scale < 0) scale = getenv("LARECOMP_TICK_SCALE") ? atof(getenv("LARECOMP_TICK_SCALE")) : 1.0;
-    if (scale != 1.0) ns = (uint64_t)(ns * scale);
-    return (uint64_t)((__uint128_t)ns * 192 / 10000);
+// The game's clock: the host's at the game speed (menu: Video > Game speed, g_settings.speed; LARECOMP_TICK_SCALE=<x>
+// at start). Continuous across a change of speed: (host, game) at the last change, read under a sequence counter.
+// The guest's system tick and GPU timestamps follow it; its sleeps and timeouts, the emulated vsync (runtime/hle/vi.c),
+// the present interval (runtime/nvn/objects.c) and the sound's rate (runtime/services/audio.c) are scaled by it.
+static _Atomic uint32_t g_speed_seq;
+static uint64_t g_speed_host0, g_speed_game0;
+static double g_speed = 1;
+double rt_speed(void) { return g_speed; }
+uint64_t rt_game_ns(void) {
+    uint64_t h0, g0;
+    double sp;
+    uint32_t s;
+    do {
+        while ((s = atomic_load(&g_speed_seq)) & 1) {}
+        h0 = g_speed_host0, g0 = g_speed_game0, sp = g_speed;
+    } while (atomic_load(&g_speed_seq) != s);
+    uint64_t now = plat_now_ns();
+    return sp == 1 && !g0 && !h0 ? now : g0 + (uint64_t)((double)(now - h0) * sp);
+}
+void rt_speed_set(double sp) {  // (any thread)
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    if (sp < 0.1) sp = 0.1;
+    pthread_mutex_lock(&mx);
+    if (sp != g_speed) {
+        uint64_t g = rt_game_ns(), h = plat_now_ns();
+        atomic_fetch_add(&g_speed_seq, 1);
+        g_speed_host0 = h, g_speed_game0 = g, g_speed = sp;
+        atomic_fetch_add(&g_speed_seq, 1);
+        LOG("[speed] the game runs at %.2fx\n", sp);
+    }
+    pthread_mutex_unlock(&mx);
+}
+// (the game's thread, each frame: the setting applied; at start, LARECOMP_TICK_SCALE)
+void rt_speed_frame(void) {
+    static int env = -1;
+    static double env_speed;
+    if (env < 0) env = getenv("LARECOMP_TICK_SCALE") && (env_speed = atof(getenv("LARECOMP_TICK_SCALE"))) > 0;
+    double want = env ? env_speed : g_settings.speed > 0 ? g_settings.speed : 1;
+    if (want != g_speed) rt_speed_set(want);
+}
+// A wait of the game's (ns of its clock) in host time
+static int64_t game_wait_ns(int64_t ns) { return g_speed == 1 ? ns : (int64_t)(ns / g_speed); }
+
+uint64_t rt_ticks(void) {  // 19.2 MHz system tick
+    return (uint64_t)((__uint128_t)rt_game_ns() * 192 / 10000);
 }
 
 static void deadline(struct timespec *ts, int64_t timeout_ns) {
+    timeout_ns = game_wait_ns(timeout_ns);
     clock_gettime(CLOCK_REALTIME, ts);
     ts->tv_sec += timeout_ns / 1000000000;
     ts->tv_nsec += timeout_ns % 1000000000;
@@ -904,7 +945,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         }
         if (t_cur->sched_core >= 0) { sched_release(t_cur); t_cur->sched_resched = true; }
         t_cur->sleeping = true;
-        for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
+        for (uint64_t end = plat_now_ns() + (uint64_t)game_wait_ns(ns), now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
             uint64_t d = end - now < 50000000 ? end - now : 50000000;
             struct timespec ts = {(time_t)(d / 1000000000), (long)(d % 1000000000)};
             nanosleep(&ts, NULL);

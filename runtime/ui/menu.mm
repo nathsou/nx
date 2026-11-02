@@ -711,6 +711,18 @@ static void page_game(void) {
         rt_request_reboot(REBOOT_GAME);
     }
     card_end();
+    card_begin("##speed", "GAME SPEED");
+    {
+        static const char *const n[] = {"0.5x", "1x", "1.5x", "2x", "3x"};
+        static const int v[] = {50, 100, 150, 200, 300};
+        int pct = (int)lroundf((g_settings.speed > 0 ? g_settings.speed : 1) * 100);
+        float w = seg_w(n, 5);
+        row_begin("Speed", "Faster or slower than on a Switch: the game's clock, its frames and its sound (higher or lower) "
+                  "follow. Above 1x the game needs the frames to keep up.", w);
+        if (segmented("##speed", &pct, n, v, 5, w)) { g_settings.speed = pct / 100.0f; settings_save(); }
+        row_end();
+    }
+    card_end();
     card_begin("##menu", "THIS MENU");
     row_begin("Pause the game while it's open", NULL, toggle_w());
     if (toggle("##pause", &g_settings.menu_pause)) settings_save();
@@ -1061,8 +1073,10 @@ static void draw_fps(void) {
     ImGui::SetNextWindowBgAlpha(0.55f);
     ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
-    if (shown > fps + 1) ImGui::Text("%.0f fps (%.0f shown)", fps, shown);
-    else ImGui::Text("%.0f fps", fps);
+    char speed[24] = "";
+    if (g_settings.speed > 0 && fabsf(g_settings.speed - 1) > 0.01f) snprintf(speed, sizeof speed, "  ·  %gx", g_settings.speed);
+    if (shown > fps + 1) ImGui::Text("%.0f fps (%.0f shown)%s", fps, shown, speed);
+    else ImGui::Text("%.0f fps%s", fps, speed);
     ImGui::End();
 }
 
