@@ -55,8 +55,9 @@ void cloud_refresh(void);     // the slots listed again (in the background)
 void cloud_upload_now(void);  // the save uploaded (in the background), changed or not
 // That slot's save downloaded into save/<game>/backups/ (in the background): CloudView::fetched when it's there
 void cloud_fetch(const std::string &key);
-// A backup was restored into root from the folder from (runtime/ui/menu.mm, the game down)
-void cloud_restored(const std::filesystem::path &root, const std::filesystem::path &from);
+// A backup was restored into root, or a save picked from the cloud (runtime/ui/menu.mm, the game down): the newest
+// save from now on
+void cloud_restored(const std::filesystem::path &root);
 // Copies the save's folders to backups/<date>[ - label] (runtime/ui/menu.mm): "" when it worked, else what went wrong
 std::string saves_back_up(const std::string &label, std::filesystem::path *made, std::filesystem::path root);
 #endif

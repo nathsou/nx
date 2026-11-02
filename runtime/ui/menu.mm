@@ -448,7 +448,7 @@ static void menu_reset(void) {  // (runtime/main.c's reboot: every guest thread 
         fs::copy(d.path(), to, fs::copy_options::recursive, ec);
         fprintf(stderr, "[saves] restored %s from %s%s\n", to.c_str(), from.c_str(), ec ? (" - failed: " + ec.message()).c_str() : "");
     }
-    cloud_restored(root, from);
+    cloud_restored(root);
     g_backups_listed = -1;
 }
 __attribute__((used, section("__DATA,__rt_reset"))) static const ResetFn menu_reset_entry = menu_reset;
