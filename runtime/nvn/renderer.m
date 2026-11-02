@@ -1110,9 +1110,18 @@ static void begin_pass(void) {
     // game waits for its previous frame before it submits the next one, so with one command buffer per frame the
     // GPU sat idle during our encoding and a frame cost GPU + encoding time (5120x1440 with the GPU clocked down:
     // ~15.5 + a few ms -> missed vsync -> 30 fps). LARECOMP_CHUNK_PASSES=<n> (0 = one buffer per frame).
-    static int chunk = -1;
-    if (chunk < 0) { const char *e = ENV("LARECOMP_CHUNK_PASSES"); chunk = e ? atoi(e) : 8; }
-    if (chunk > 0 && cmdbuf && ++g_passes_in_cb >= chunk) renderer_submit();
+    // Each commit costs the driver ~0.3 ms of CPU, though: by default about three a frame (the last frame's passes / 3,
+    // at least 8 passes each) - Animal Crossing's ~60 passes took 7-8 commits a frame at 8 (2026-11-01: 4% of the
+    // process's CPU at 30 fps on a Mac, half the commits at 24 passes, the frame rate unchanged).
+    static int chunk = -1, fixed;
+    if (chunk < 0) { const char *e = ENV("LARECOMP_CHUNK_PASSES"); fixed = e != NULL; chunk = e ? atoi(e) : 8; }
+    static uint64_t frame_at;
+    static int frame_passes, last_passes;
+    uint64_t f = renderer_exec_frame();
+    if (f != frame_at) frame_at = f, last_passes = frame_passes, frame_passes = 0;
+    frame_passes++;
+    int per = fixed || last_passes / 3 < chunk ? chunk : last_passes / 3;
+    if (chunk > 0 && cmdbuf && ++g_passes_in_cb >= per) renderer_submit();
     enc = [cb() renderCommandEncoderWithDescriptor:rp];
     opening_pass = false;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -1896,6 +1905,21 @@ static bool sync_shaders(void) {  // LARECOMP_SYNC_SHADERS: compile on first use
     return v || g_draw_must_run;
 }
 
+// The game's fragment / compute shaders' compile options. LARECOMP_FS_MATH=safe|relaxed|fast: Metal's math mode
+static MTLCompileOptions *game_options(void) {
+    static MTLCompileOptions *o;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *m = getenv("LARECOMP_FS_MATH");
+        if (!m) return;
+        o = [MTLCompileOptions new];
+        if (@available(macOS 15.0, iOS 18.0, *))
+            o.mathMode = !strcmp(m, "safe") ? MTLMathModeSafe : !strcmp(m, "relaxed") ? MTLMathModeRelaxed : MTLMathModeFast;
+        LOG("[shader] fragment math mode: %s\n", m);
+    });
+    return o;
+}
+
 static void compile_program(Prog *pr) {
     NSError *err = nil;
     static MTLCompileOptions *vopts;
@@ -1906,7 +1930,7 @@ static void compile_program(Prog *pr) {
     NSString *salt = getenv("LARECOMP_SHADER_SALT") ? [NSString stringWithFormat:@"\n// %s\n", getenv("LARECOMP_SHADER_SALT")] : @"";
     id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:vopts error:&err];
     if (!vl) { LOG("[shader] VS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->vi->msl); pr->failed = true; return; }
-    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:nil error:&err];
+    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:game_options() error:&err];
     if (!fl) { LOG("[shader] FS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->fi->msl); pr->failed = true; return; }
     g_lib_us += (uint64_t)((now_ms() - t0) * 1000);
     pr->vs = [vl newFunctionWithName:@"main0"];
@@ -2351,8 +2375,8 @@ static void resolve_feedback(Prog *pr) {
 // (maxwell/translate.c). Each distinct sampler state the draw uses goes in a slot of its own - textures sharing a state
 // share its slot - so every texture keeps its own filtering, wrapping and compare mode. smp[i] / desc[i]: texture i's
 // state and its descriptor (NULL: the default sampler); fills slot[] and map[], returns the slots used.
-static int sampler_slots(int n, __strong id<MTLSamplerState> *smp, NvnSamplerDesc *const *desc,
-                         __strong id<MTLSamplerState> *slot, uint32_t *map) {
+static int sampler_slots(int n, __unsafe_unretained id<MTLSamplerState> *smp, NvnSamplerDesc *const *desc,
+                         __unsafe_unretained id<MTLSamplerState> *slot, uint32_t *map) {
     const NvnSamplerDesc *sdesc[MSL_MAX_SAMPLERS] = {0};
     int ns = 0;
     for (int i = 0; i < n; i++) {
@@ -2379,7 +2403,8 @@ static void bind_textures(int stage, ShaderInfo *si) {
         draw_recolour_names[0] = 0;
     }
     bool mapped = si->ntex > MSL_MAX_SAMPLERS;  // (fragment only: the translator refuses such vertex shaders)
-    __strong id<MTLSamplerState> msmp[64];
+    __unsafe_unretained id<MTLSamplerState> msmp[64];  // (the samplers live in sampler_for's cache / default_sampler: a
+    // __strong array cost 64 objc_release calls a stage, every draw - 6% of the render thread, ACNH)
     NvnSamplerDesc *mdesc[64];
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
@@ -2502,7 +2527,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
         else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
     }
     if (mapped && stage == 1) {
-        __strong id<MTLSamplerState> slot[MSL_MAX_SAMPLERS];
+        __unsafe_unretained id<MTLSamplerState> slot[MSL_MAX_SAMPLERS];
         uint32_t map[64];
         int ns = sampler_slots(si->ntex, msmp, mdesc, slot, map);
         for (int k = 0; k < MSL_MAX_SAMPLERS; k++) [enc setFragmentSamplerState:k < ns ? slot[k] : default_sampler() atIndex:k];
@@ -3093,7 +3118,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (si->uses_gmem) [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
     CST("textures");
     bool cmapped = si->ntex > MSL_MAX_SAMPLERS;
-    __strong id<MTLSamplerState> msmp[64];
+    __unsafe_unretained id<MTLSamplerState> msmp[64];  // (the samplers live in sampler_for's cache / default_sampler: a
+    // __strong array cost 64 objc_release calls a stage, every draw - 6% of the render thread, ACNH)
     NvnSamplerDesc *mdesc[64];
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
@@ -3126,7 +3152,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         else [ce setSamplerState:smp atIndex:i];
     }
     if (cmapped) {  // (more textures than sampler slots: as bind_textures)
-        __strong id<MTLSamplerState> slot[MSL_MAX_SAMPLERS];
+        __unsafe_unretained id<MTLSamplerState> slot[MSL_MAX_SAMPLERS];
         uint32_t map[64];
         int ns = sampler_slots(si->ntex, msmp, mdesc, slot, map);
         for (int k = 0; k < MSL_MAX_SAMPLERS; k++) [ce setSamplerState:k < ns ? slot[k] : default_sampler() atIndex:k];
@@ -3541,7 +3567,7 @@ static bool prog_mv_ready(Prog *pr) {
         dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
         NSError *err = nil;
         id<MTLLibrary> vl = [dev newLibraryWithSource:@(vs) options:vopts error:&err];
-        id<MTLLibrary> fl = vl ? [dev newLibraryWithSource:@(fs) options:nil error:&err] : nil;
+        id<MTLLibrary> fl = vl ? [dev newLibraryWithSource:@(fs) options:game_options() error:&err] : nil;
         if (!vl || !fl) {
             static int nlog;
             if (nlog++ < 10) LOG("[mv] variant compile failed: %s\n%s\n", err.localizedDescription.UTF8String, vl ? fs : vs);
@@ -3571,7 +3597,7 @@ static bool prog_ui_ready(Prog *pr) {
     if (!q) q = dispatch_queue_create("larecomp.ui", DISPATCH_QUEUE_CONCURRENT);
     dispatch_async(q, ^{
         NSError *err = nil;
-        id<MTLLibrary> fl = [dev newLibraryWithSource:@(fs) options:nil error:&err];
+        id<MTLLibrary> fl = [dev newLibraryWithSource:@(fs) options:game_options() error:&err];
         bool ok = fl != nil;
         for (int m = 0; ok && m < 3; m++) {
             MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
@@ -3660,12 +3686,27 @@ static void draw(CmdRec *r, bool indexed) {
         static uint64_t log_hash = 1;
         if (log_hash == 1) log_hash = getenv("LARECOMP_LOG_FSHASH") ? 0 : 2;
         if (!log_hash && g_debug_frame) LOG("[fshash] fs=%llx hash %016llx\n", fs, last_hash);
+        {   // LARECOMP_LIST_FSHASH=<frame>: each fragment shader drawn from that frame on, once (bisecting with SKIP_FSHASH)
+            static long from = -2;
+            if (from == -2) from = getenv("LARECOMP_LIST_FSHASH") ? atol(getenv("LARECOMP_LIST_FSHASH")) : -1;
+            static uint64_t seen[4096];
+            static int nseen;
+            if (from >= 0 && (long)renderer_exec_frame() >= from && nseen < 4096) {
+                bool known = false;
+                for (int i = 0; i < nseen && !known; i++) known = seen[i] == last_hash;
+                if (!known) {
+                    seen[nseen++] = last_hash;
+                    LOG("[fslist] %016llx fs %llx rt %ux%u ntex %d\n", (unsigned long long)last_hash, (unsigned long long)fs, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
+                        st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, pr->fi->ntex);
+                }
+            }
+        }
         {   // LARECOMP_SKIP_FSHASH=h1,h2,...: drop draws using these fragment shaders (find which draw makes what)
-            static uint64_t skip[16];
+            static uint64_t skip[128];
             static int nskip = -1;
             if (nskip < 0) {
                 nskip = 0;
-                for (const char *p = getenv("LARECOMP_SKIP_FSHASH"); p && *p && nskip < 16;) {
+                for (const char *p = getenv("LARECOMP_SKIP_FSHASH"); p && *p && nskip < 128;) {
                     skip[nskip++] = strtoull(p, (char **)&p, 16);
                     while (*p == ',') p++;
                 }
@@ -3940,8 +3981,9 @@ static void draw(CmdRec *r, bool indexed) {
             f[1] = f[1] * hw_scale - (st.rt.depth && st.rt.depth->format == 0x32 ? hw_eps / 256 : hw_eps);
             f[2] *= hw_scale;
         }
-        static int nlog;
-        if ((st.poly[3] & 4) && nlog < 3 && getenv("LARECOMP_LOG_BIAS")) { nlog++; LOG("[bias] factor %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]); }
+        static int nlog, log_bias = -1;  // (cached: read on every offset draw it cost 1% of the render thread)
+        if (log_bias < 0) log_bias = getenv("LARECOMP_LOG_BIAS") != NULL;
+        if ((st.poly[3] & 4) && nlog < 3 && log_bias) { nlog++; LOG("[bias] factor %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]); }
         if (memcmp(f, last, sizeof f) || enc != last_bias_enc) {
             [enc setDepthBias:f[1] slopeScale:f[0] clamp:f[2]];
             memcpy(last, f, sizeof f);
