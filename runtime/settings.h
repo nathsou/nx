@@ -39,6 +39,16 @@ typedef struct {
     bool menu_pause;     // the game pauses while the in-game menu is open (runtime/ui/menu.mm)
     int touch_pad;       // TOUCH_PAD_*: iOS's on-screen controller (runtime/ui/touch_pad.mm)
     float speed;         // the game's speed: 1 as on a Switch, 0.5 half, 2 twice (runtime/kernel.c rt_game_ns)
+    // cloud saves (runtime/ui/cloud.mm): an S3-compatible bucket (Backblaze B2, ...) - its endpoint, name, folder in it
+    // and the application key's ID; the key's secret is kept apart (the Keychain on iOS, cloud.secret elsewhere)
+    bool cloud;               // uploads and the check at boot on (when a bucket is set)
+    bool cloud_cellular;      // iOS: also over mobile data
+    char cloud_endpoint[256];  // "https://s3.eu-central-003.backblazeb2.com"
+    char cloud_bucket[128];
+    char cloud_prefix[128];   // a folder in the bucket ("" = its top)
+    char cloud_key_id[128];
+    char cloud_device[64];     // this device's name, as other devices show its saves
+    char cloud_device_id[64];  // its slot in the bucket (<game>/<id>.nxsave): made once, kept when the name changes
     long long time_offset;  // seconds the game's clock runs from this Mac's (Date & time: runtime/services/time.c)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect

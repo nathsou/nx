@@ -2,6 +2,7 @@
 #include "paths.h"
 #include "settings.h"
 #include "ui/menu.h"
+#include "ui/cloud.h"
 // Metal renderer for the NVN layer: window, textures, command execution, presentation.
 #include <sys/stat.h>
 #include <TargetConditionals.h>
@@ -2023,7 +2024,8 @@ int ui_run(void) {
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {
             input_rumble_poll();
-            if (e.type == SDL_EVENT_QUIT) { input_rumble_stop(); input_led_stop(); LOG("window closed\n"); backend_quit(); exit(0); }
+            if (e.type == SDL_EVENT_QUIT) { input_rumble_stop(); input_led_stop(); LOG("window closed\n"); backend_quit(); cloud_quit(); exit(0); }
+            if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND) cloud_flush();  // (iOS: the save uploaded, if it changed)
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
             input_cursor_event(&e);
             if (menu_handle_event(&e)) continue;

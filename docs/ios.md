@@ -52,6 +52,8 @@ free account's profiles last 7 days (install again after), and a device takes at
 - **The menu**: touch the screen and the ≡ button appears at the top for a few seconds - tap it. Or press Home on a
   controller (a Switch Pro controller's, the Xbox / PlayStation button), or Minus + Plus together, or F1 / Esc on a
   keyboard. It is sized for fingers: tap to press, drag up / down to scroll, drag sideways to move a slider.
+- **Saves on other devices**: Saves > Cloud saves keeps the save in your own Backblaze B2 (or S3-compatible) bucket,
+  so the iPhone, the iPad and the Mac play the same one: [cloud-saves.md](cloud-saves.md).
 - **Controllers**: any controller iOS knows (Xbox, PlayStation, Switch Pro, MFi), paired in Settings > Bluetooth.
   The last one used drives the game.
 - **Touch**: Apple's on-screen controller (stick, A / B / X / Y in the Switch's places, L / R / ZL / ZR) appears

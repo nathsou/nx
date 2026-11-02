@@ -105,7 +105,7 @@ and its sound is muted (Game tab: uncheck the option to keep it running). Change
 
 - **Game**: resume, restart the game, quit; the *game speed* (0.5x to 3x): the game's clock, frames and sound run that
   much faster or slower (the sound higher or lower). Above 1x the machine has to draw the extra frames.
-- **Saves**: the current save, backups, restoring one (see [Saves](#saves)).
+- **Saves**: the current save, cloud saves, backups, restoring one (see [Saves](#saves)).
 - **Date & time**: the clock the game sees - this Mac's, or a date and time of your own (Animal Crossing's seasons,
   shops and events follow it). Animal Crossing reads it when it starts, as on a Switch: the tab has a button to
   restart the game with the new clock.
@@ -142,6 +142,11 @@ The menu's **Saves** tab shows the current save and keeps backups in `save/<game
 now* copies the save there; *Restore* copies a backup back and restarts the game (the current save is backed up
 first, so a restore can be undone); *Delete* removes one; *Open the saves folder* shows it in Finder. A save folder
 copied into `backups/` by hand appears in the list too.
+
+**Cloud saves** share a game's save between your devices (Mac, iPhone, iPad) through your own storage bucket
+(Backblaze B2, or any S3-compatible one): each device uploads its save after the game saves, and a game starts with
+the newest save of it from any device, after backing up the one it replaces. Setting it up with Backblaze, and how it
+decides: [docs/cloud-saves.md](docs/cloud-saves.md).
 
 Animal Crossing ties each resident to the Switch account that created it: to play a save from a console, run nx as
 that account with `LARECOMP_USER_ID=<id>` (`tools/acnh_save.py <save folder>` prints it), or the game starts a new

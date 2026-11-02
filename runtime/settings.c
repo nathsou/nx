@@ -39,6 +39,8 @@ Settings g_settings = {
     .show_fps = false,
     .menu_pause = true,
     .speed = 1,
+    .cloud = true,
+    .cloud_cellular = true,
     .inv_keys = true,
     .tracker = true,
     .tracker_filters = -1,
@@ -141,13 +143,13 @@ void settings_load(void) {
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
-    char line[256];
+    char line[512];
     bool tip_key = false, aspect_key = false;
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
         char key[64];
-        char val[128] = {0};
-        int fields = sscanf(line, " %63[^= ] = %127[^\n]", key, val);
+        char val[320] = {0};
+        int fields = sscanf(line, " %63[^= ] = %319[^\n]", key, val);
         if (fields < 1) continue;
         if (fields != 2) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
@@ -176,6 +178,14 @@ void settings_load(void) {
         else if (!strcmp(key, "touch_controller")) g_settings.touch_pad = atoi(val);
         else if (!strcmp(key, "game_speed")) g_settings.speed = (float)atof(val);
         else if (!strcmp(key, "time_offset")) g_settings.time_offset = atoll(val);
+        else if (!strcmp(key, "cloud_sync")) g_settings.cloud = atoi(val) != 0;
+        else if (!strcmp(key, "cloud_mobile_data")) g_settings.cloud_cellular = atoi(val) != 0;
+        else if (!strcmp(key, "cloud_endpoint")) snprintf(g_settings.cloud_endpoint, sizeof g_settings.cloud_endpoint, "%s", val);
+        else if (!strcmp(key, "cloud_bucket")) snprintf(g_settings.cloud_bucket, sizeof g_settings.cloud_bucket, "%s", val);
+        else if (!strcmp(key, "cloud_folder")) snprintf(g_settings.cloud_prefix, sizeof g_settings.cloud_prefix, "%s", val);
+        else if (!strcmp(key, "cloud_key_id")) snprintf(g_settings.cloud_key_id, sizeof g_settings.cloud_key_id, "%s", val);
+        else if (!strcmp(key, "cloud_device")) snprintf(g_settings.cloud_device, sizeof g_settings.cloud_device, "%s", val);
+        else if (!strcmp(key, "cloud_device_id")) snprintf(g_settings.cloud_device_id, sizeof g_settings.cloud_device_id, "%s", val);
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
@@ -244,9 +254,17 @@ void settings_save(void) {
     if (g_settings.fps_cap) fprintf(f, "frame_rate_limit = %d\n", g_settings.fps_cap);
     else fprintf(f, "frame_rate_limit = display\n");
     fprintf(f, "pause_in_menu = %d\n", g_settings.menu_pause);
-    fprintf(f, "touch_controller = %d\n", g_settings.touch_pad);
-    fprintf(f, "game_speed = %g\n", g_settings.speed);  // (1: as on a Switch)  // (iOS: 0 without a controller, 1 always, 2 never)
+    fprintf(f, "touch_controller = %d\n", g_settings.touch_pad);  // (iOS: 0 without a controller, 1 always, 2 never)
+    fprintf(f, "game_speed = %g\n", g_settings.speed);  // (1: as on a Switch)
     fprintf(f, "time_offset = %lld\n", g_settings.time_offset);
+    fprintf(f, "cloud_sync = %d\n", g_settings.cloud);
+    fprintf(f, "cloud_mobile_data = %d\n", g_settings.cloud_cellular);
+    fprintf(f, "cloud_endpoint = %s\n", g_settings.cloud_endpoint);
+    fprintf(f, "cloud_bucket = %s\n", g_settings.cloud_bucket);
+    fprintf(f, "cloud_folder = %s\n", g_settings.cloud_prefix);
+    fprintf(f, "cloud_key_id = %s\n", g_settings.cloud_key_id);
+    fprintf(f, "cloud_device = %s\n", g_settings.cloud_device);
+    fprintf(f, "cloud_device_id = %s\n", g_settings.cloud_device_id);
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
