@@ -46,6 +46,8 @@
 extern "C" {
 #include "../settings.h"
 }
+#include "cloud.h"
+#include "s3.h"
 
 namespace fs = std::filesystem;
 
@@ -117,6 +119,7 @@ static void set_open(bool on) {
     if (g_open == on) return;
     g_open = on;
     if (on) renderer_request_cover();  // (the game's picture for the selection screen: its next frame, once resumed)
+    if (on) cloud_flush();  // (a pause: the save uploaded now if it changed - runtime/ui/cloud.mm)
     input_reset();  // (keys held when it opened don't stay pressed for the game)
 }
 void menu_test_open(void) { set_open(true); }
@@ -427,9 +430,11 @@ static std::string back_up(const std::string &label, fs::path *made = nullptr, f
     if (made) *made = dst;
     return "";
 }
+std::string saves_back_up(const std::string &label, fs::path *made, fs::path root) { return back_up(label, made, root); }
 
 typedef void (*ResetFn)(void);
 static void menu_reset(void) {  // (runtime/main.c's reboot: every guest thread has stopped)
+    cloud_teardown();  // (the save as the game left it, before a restore replaces it)
     if (g_restore_from.empty()) return;
     fs::path from = g_restore_from, root = g_restore_root;
     g_restore_from.clear();
@@ -443,6 +448,7 @@ static void menu_reset(void) {  // (runtime/main.c's reboot: every guest thread 
         fs::copy(d.path(), to, fs::copy_options::recursive, ec);
         fprintf(stderr, "[saves] restored %s from %s%s\n", to.c_str(), from.c_str(), ec ? (" - failed: " + ec.message()).c_str() : "");
     }
+    cloud_restored(root, from);
     g_backups_listed = -1;
 }
 __attribute__((used, section("__DATA,__rt_reset"))) static const ResetFn menu_reset_entry = menu_reset;
@@ -736,6 +742,137 @@ static void page_game(void) {
     card_end();
 }
 
+// Cloud saves (runtime/ui/cloud.mm): the bucket, this device's name, each device's save of this game
+static std::mutex g_paste_mx;  // (main thread -> render thread: the clipboard's text, read where UIKit / AppKit want it)
+static std::string g_pasted;
+static std::atomic<bool> g_paste_ready{false};
+static void paste_request(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+#if MENU_TOUCH
+        NSString *s = UIPasteboard.generalPasteboard.string;
+#else
+        NSString *s = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+#endif
+        std::lock_guard<std::mutex> l(g_paste_mx);
+        g_pasted = s ? s.UTF8String : "";
+        g_paste_ready = true;
+    });
+}
+static void cloud_card(void) {
+    static char conn[512];
+    static std::string conn_error, pick;
+    static bool restart_wanted;
+    static double asked = -1;
+    CloudView v = cloud_view();
+    if (restart_wanted && !v.fetched.empty()) {  // (the save chosen below is here: restored by a restart, as a backup is)
+        restart_wanted = false;
+        std::error_code ec;
+        g_restore_from = v.fetched;
+        g_restore_root = fs::absolute(save_root(), ec);
+        set_open(false);
+        rt_request_reboot(REBOOT_GAME);
+    }
+    if (restart_wanted && !v.busy && !v.error.empty()) restart_wanted = false;
+    card_begin("##cloud", "CLOUD SAVES");
+    if (!v.configured) {
+        help("Keep each device's save in your own storage bucket (Backblaze B2, or any S3-compatible one) and play the "
+             "newest on any device: a game checks for a newer one when it starts.");
+        ImGui::Dummy(ImVec2(0, em() * 0.2f));
+        if (g_paste_ready.exchange(false)) {
+            std::lock_guard<std::mutex> l(g_paste_mx);
+            snprintf(conn, sizeof conn, "%s", s3::trim(g_pasted).c_str());
+        }
+        const ImGuiStyle &st = ImGui::GetStyle();
+        float pw = ImGui::CalcTextSize("Paste").x + ImGui::CalcTextSize("Connect").x + st.FramePadding.x * 4 + st.ItemSpacing.x * 2;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - pw);
+        ImGui::InputTextWithHint("##conn", "s3://<key ID>:<application key>@<endpoint>/<bucket>", conn, sizeof conn,
+                                 ImGuiInputTextFlags_Password);
+        ImGui::SameLine();
+        if (button("Paste")) paste_request();
+        ImGui::SameLine();
+        if (button("Connect", true)) {
+            std::string why;
+            if (cloud_connect(conn, &why)) conn[0] = 0, conn_error.clear();
+            else conn_error = "Can't connect: " + why;
+        }
+        if (!conn_error.empty()) help(conn_error.c_str());
+        card_end();
+        return;
+    }
+    if (asked < 0 || (ImGui::GetTime() - asked > 120 && !v.busy)) {  // (listed when the page is first shown, then each 2 minutes)
+        asked = ImGui::GetTime();
+        if (!v.listed || time(NULL) - v.listed > 60) cloud_refresh();
+    }
+    row_begin("Sync this device", (v.bucket + "  ·  " + v.endpoint).c_str(), toggle_w());
+    if (toggle("##cloud_on", &g_settings.cloud)) settings_save();
+    row_end();
+    float nw = fminf(em() * 11, ImGui::GetContentRegionAvail().x * 0.45f);
+    row_begin("This device's name", "What other devices call its saves", nw);
+    ImGui::SetNextItemWidth(nw);
+    ImGui::InputText("##device", g_settings.cloud_device, sizeof g_settings.cloud_device);
+    if (ImGui::IsItemDeactivatedAfterEdit()) settings_save();
+    row_end();
+#if MENU_TOUCH
+    row_begin("Use mobile data", "Uploads and downloads away from Wi-Fi (a save can be tens of MB)", toggle_w());
+    if (toggle("##cloud_cell", &g_settings.cloud_cellular)) settings_save();
+    row_end();
+#endif
+    std::string line = v.error.empty() ? v.status : v.error;
+    if (v.progress >= 0) line += "  ·  " + std::to_string((int)(v.progress * 100)) + "%";
+    else if (v.busy && line.empty()) line = "Working...";
+    if (!line.empty()) {
+        if (!v.error.empty()) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.45f, 1));
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(line.c_str());
+        ImGui::PopTextWrapPos();
+        if (!v.error.empty()) ImGui::PopStyleColor();
+    }
+    ImGui::Dummy(ImVec2(0, em() * 0.2f));
+    ImGui::BeginDisabled(v.busy);
+    if (button("Upload now")) cloud_upload_now();
+    ImGui::SameLine();
+    if (button("Check again")) cloud_refresh();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (button("Disconnect")) ImGui::OpenPopup("Disconnect cloud saves?");
+    if (confirm("Disconnect cloud saves?", "This device stops syncing and forgets the key. The saves in the bucket stay.", "Disconnect"))
+        cloud_disconnect();
+    for (size_t i = 0; i < v.slots.size(); i++) {
+        const CloudSlot &s = v.slots[i];
+        ImGui::PushID((int)i);
+        separator();
+        const char *tag = s.current ? "In use here" : NULL;
+        float bw = tag ? ImGui::CalcTextSize(tag).x : ImGui::CalcTextSize("Use this save").x + ImGui::GetStyle().FramePadding.x * 2;
+        if (!tag && !s.same_game) bw = 0;
+        float x0 = ImGui::GetCursorPosX(), avail = ImGui::GetContentRegionAvail().x;
+        ImGui::BeginGroup();
+        ImGui::PushTextWrapPos(x0 + avail - bw - em());
+        ImGui::TextUnformatted((s.device + (s.mine ? " (this device)" : "")).c_str());
+        ImGui::PopTextWrapPos();
+        std::string d = "Saved " + format_time(s.saved) + "  ·  " + human_bytes(s.size);
+        if (!s.same_game) d += "  ·  another version of the game" + (s.version.empty() ? "" : " (" + s.version + ")");
+        help_at(d.c_str(), x0 + avail - bw - em());
+        ImGui::EndGroup();
+        if (bw > 0) ImGui::SameLine(x0 + avail - bw);
+        if (tag) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(C_ACCENT, "%s", tag);
+        } else if (s.same_game) {
+            ImGui::BeginDisabled(v.busy);
+            if (button("Use this save")) { pick = s.key; ImGui::OpenPopup("Use this save?"); }
+            ImGui::EndDisabled();
+        }
+        if (pick == s.key) {
+            std::string q = "The save from " + s.device + " (" + format_time(s.saved) +
+                            ") replaces the one here, which is backed up first, and the game restarts.";
+            if (confirm("Use this save?", q.c_str(), "Download and restart")) { cloud_fetch(s.key); restart_wanted = true; }
+        }
+        ImGui::PopID();
+    }
+    if (v.slots.empty() && v.listed) { separator(); help("No device has uploaded a save of this game yet."); }
+    card_end();
+}
+
 static void page_saves(void) {
     double now = ImGui::GetTime();
     if (g_backups_listed < 0 || now - g_backups_listed > 5) { list_backups(); g_backups_listed = now; }
@@ -769,6 +906,7 @@ static void page_saves(void) {
     }
 #endif
     card_end();
+    cloud_card();
     card_begin("##backups", "BACKUPS");
     help("A backup is a copy of the save. Restoring one puts it back and restarts the game, after backing up the "
          "current save first.");
@@ -1098,6 +1236,8 @@ static void draw_menu(void) {
     static long every = -1, at;
     if (every < 0) every = getenv("LARECOMP_MENU_TABS_EVERY") ? atol(getenv("LARECOMP_MENU_TABS_EVERY")) : 0;
     if (every > 0) { uint64_t g, sh; renderer_frame_counts(&g, &sh); if (!at) at = (long)g; g_page = (int)(((long)g - at) / every) % n; }
+    static int page = getenv("LARECOMP_MENU_PAGE") ? atoi(getenv("LARECOMP_MENU_PAGE")) : -1;  // (test: open on that page)
+    if (page >= 0 && page < n) g_page = page, page = -1;
     if (!g_popup && ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) g_page = (g_page + n - 1) % n;  // (L / R: the pages)
     if (!g_popup && ImGui::IsKeyPressed(ImGuiKey_GamepadR1)) g_page = (g_page + 1) % n;
 

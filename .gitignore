@@ -14,5 +14,7 @@ save/
 cache/
 dreadrecomp.ini
 nx.ini
+cloud.secret
+cloud.secret.tmp
 .DS_Store
 data/

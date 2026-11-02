@@ -23,6 +23,7 @@ static const char *rando_seed_dir(void) { return NULL; }
 static bool rando_romfs_override(const char *path, char *out, size_t cap) { (void)path, (void)out, (void)cap; return false; }
 #include "../ipc.h"
 #include "../romfs_build.h"
+#include "../ui/cloud.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -723,9 +724,14 @@ static void drop_slot(const char *path) {
     unlink(pending);
     unlink(flags_pending);
 }
+// Held while a commit replaces files, and while cloud saves read the save (runtime/ui/cloud.mm): never half a commit
+static pthread_mutex_t g_save_lock = PTHREAD_MUTEX_INITIALIZER;
+void save_lock(void) { pthread_mutex_lock(&g_save_lock); }
+void save_unlock(void) { pthread_mutex_unlock(&g_save_lock); }
+
 // Commit always succeeds for the game (see save_failed). A save that failed is dropped whole. If only the sidecar's
 // rename failed (the data is already replaced), its working copy stays for the next mount to finish the pair.
-static void commit(HostFs *fs) {
+static void commit_mount(HostFs *fs) {
     extern void pace_hitch(const char *why);  // nvn/pace.c
     if (fs->npending) pace_hitch("a save commit");
     for (int i = 0; i < fs->npending; i++) {
@@ -746,6 +752,13 @@ static void commit(HostFs *fs) {
         } else LOG("[save] committed %s\n", path);
     }
     fs->npending = 0;
+}
+static void commit(HostFs *fs) {
+    save_lock();
+    bool any = fs->npending > 0;
+    commit_mount(fs);
+    save_unlock();
+    if (any && fs->journaled) cloud_save_committed();
 }
 // Recover pairs before dropping abandoned working copies: deleting the data copy first would make an
 // uncommitted sidecar look committed. No format change: existing .flagsx files still contain just flag bytes.
@@ -1104,9 +1117,18 @@ static void multi_commit(Service *s, IpcReq *req, IpcResp *resp) {
         m->fs[m->n++] = o;
         break;
     }
-    case 2:  // Commit
-        for (int i = 0; i < m->n; i++) commit(m->fs[i]->state);
+    case 2: {  // Commit (all together: cloud saves never read between two of them)
+        bool any = false;
+        save_lock();
+        for (int i = 0; i < m->n; i++) {
+            HostFs *fs = m->fs[i]->state;
+            any |= fs->npending > 0 && fs->journaled;
+            commit_mount(fs);
+        }
+        save_unlock();
+        if (any) cloud_save_committed();
         break;
+    }
     default: LOG("[fs] IMultiCommitManager cmd %u (ok)\n", req->cmd);
     }
 }

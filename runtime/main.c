@@ -20,6 +20,7 @@
 #include "hle.h"
 #include "kernel.h"
 #include "ui/menu.h"
+#include "ui/cloud.h"
 
 const char *g_romfs_dir;
 
@@ -142,7 +143,7 @@ void backend_quit(void);              // quitting: the render thread stopped, th
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
     while (SDL_PollEvent(&e))
-        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); backend_quit(); exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); backend_quit(); cloud_quit(); exit(0); }
 }
 
 static void teardown(void) {
@@ -189,6 +190,7 @@ static void boot(const char *root) {
     menu_loading_status("Loading the game");
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
+    cloud_boot();  // (a newer save from another device: runtime/ui/cloud.mm)
     kernel_init();
     dispatch_init();
 

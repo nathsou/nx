@@ -85,7 +85,7 @@ DEPINC   := -I$(DEPS)/include
 LDFLAGS  := -L$(DEPS)/lib -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd -lbz2 -lz -liconv \
             $(addprefix -framework ,CoreFoundation Foundation Metal QuartzCore UIKit ImageIO CoreGraphics \
               UniformTypeIdentifiers CoreMedia CoreVideo CoreAudio AudioToolbox AVFoundation CoreBluetooth CoreMotion \
-              GameController CoreText OpenGLES $(if $(filter iphoneos,$(IOS_SDK)),MetalFX)) -weak_framework CoreHaptics -Wl,-rpath,@executable_path/Frameworks
+              GameController CoreText OpenGLES Security $(if $(filter iphoneos,$(IOS_SDK)),MetalFX)) -weak_framework CoreHaptics -Wl,-rpath,@executable_path/Frameworks
 BACKEND_SRC := $(wildcard runtime/nvn/*.m)
 BACKEND_OBJ := $(patsubst runtime/%.m,$(B)/rt/%.o,$(BACKEND_SRC))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_metal.o
