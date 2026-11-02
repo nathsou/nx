@@ -746,8 +746,9 @@ extern "C" void cloud_boot(void) {
     } else if (other)
         note = "The save from " + other->device + " (" + fmt_time(other->saved) + ") is from another version of the game" +
                (other->version.empty() ? "" : " (" + other->version + ")") + ": not used";
-    bool up = local.any;
-    for (auto &s : slots) if (s.hash == local.hash) up = false;  // (already there: this device's, or the one just used)
+    bool up = local.any;  // (unless the bucket has it already: this device's upload, or the save just used)
+    if (best && note.compare(0, 6, "Using ") == 0) mine = best->saved;
+    for (auto &s : slots) if (s.hash == local.hash && s.saved >= mine) up = false;
     {
         std::lock_guard<std::mutex> l(g_lock);
         publish_slots(slots, g, local.hash);
@@ -820,7 +821,7 @@ static void refresh_job(bool upload_missing) {
     std::vector<Slot> slots;
     bool ok = snapshot(&local, &why) && list_slots(c, g.key, &slots, &why);
     bool up = upload_missing && local.any;
-    for (auto &s : slots) if (s.hash == local.hash) up = false;
+    for (auto &s : slots) if (s.hash == local.hash && s.saved >= local_saved(local)) up = false;
     {
         std::lock_guard<std::mutex> l(g_lock);
         if (!ok) { status("Couldn't check the cloud saves: " + why, true); return; }
@@ -887,8 +888,7 @@ void cloud_fetch(const std::string &key) {
             for (char &ch : name) if (ch == '/' || ch == ':' || ch == '\\') ch = '-';
             dst = fs::path(g.root) / "backups" / name;
             ok = tar_extract(tar, dst, &why);
-            if (ok) state_write(dst, {s.hash, s.saved});  // (what it is: cloud_restored keeps it)
-            else { std::error_code ec; fs::remove_all(dst, ec); }
+            if (!ok) { std::error_code ec; fs::remove_all(dst, ec); }
         }
         std::lock_guard<std::mutex> l(g_lock);
         g_view.busy = false, g_view.progress = -1;
@@ -897,11 +897,10 @@ void cloud_fetch(const std::string &key) {
         g_view.fetched = dst;
     });
 }
-// A backup was restored into root (runtime/ui/menu.mm, while the game is down): a cloud save keeps what it is; any
-// other is the newest save from now on (the other devices take it)
-void cloud_restored(const fs::path &root, const fs::path &from) {
-    State st = state_read(from);
-    if (!st.hash.empty()) { state_write(root, st); return; }
+// A backup was restored into root, or a save picked from the cloud (runtime/ui/menu.mm, while the game is down): it's
+// the newest save from now on, uploaded at the next boot for the other devices to take. (Kept at the time it was
+// saved, a picked save would lose at boot to this device's own newer upload.)
+void cloud_restored(const fs::path &root) {
     Snap s;
     s.root = root.string();
     std::string why;
