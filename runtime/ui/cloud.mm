@@ -14,7 +14,7 @@
 //   differs from it changed since (played offline): its time is that of its newest file.
 // Credentials: the endpoint, the bucket and the application key's ID in nx.ini; the key's secret in the Keychain on
 // iOS, in cloud.secret (owner-only) elsewhere. LARECOMP_CLOUD=<connection> (tests): that bucket, nothing stored;
-// LARECOMP_CLOUD_DEVICE=<name>: another device's name and slot; LARECOMP_CLOUD_EVERY=<s>: uploads that often at most. The transport is NSURLSession: Apple's only for now.
+// LARECOMP_CLOUD_DEVICE=<name>: another device's name and slot; LARECOMP_CLOUD_EVERY=<s>: uploads that often at most. The transport is NSURLSession on Apple's platforms, libcurl on Linux.
 #include "cloud.h"
 
 #include "s3.h"
@@ -26,6 +26,9 @@
 #if TARGET_OS_IPHONE
 #import <UIKit/UIKit.h>
 #endif
+#endif
+#if defined(__linux__)
+#include <curl/curl.h>
 #endif
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -51,7 +54,7 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
-#if defined(__APPLE__)  // (the transport, and the menu that restores a save: Apple's only for now)
+#if defined(__APPLE__) || defined(__linux__)  // (the transport, and the menu that restores a save)
 
 // ------------------------------------------------------------------ the bucket
 struct Conn { std::string scheme = "https", host, region, bucket, prefix, key_id, secret; };
@@ -182,6 +185,87 @@ static bool conn(Conn *c) {
 struct Resp { int status = 0; std::string body, error; std::map<std::string, std::string> headers; /* (lower-case names) */ };
 using Progress = std::function<void(double)>;
 
+#if defined(__linux__)
+// libcurl: one easy handle per request (a few a minute at most), the body sent from memory, the reply's headers kept
+struct CurlIo { Resp *o; const std::string *body; size_t sent = 0; const Progress *progress; bool up; };
+static size_t curl_write(char *p, size_t sz, size_t n, void *u) { ((CurlIo *)u)->o->body.append(p, sz * n); return sz * n; }
+static size_t curl_read(char *p, size_t sz, size_t n, void *u) {
+    CurlIo *io = (CurlIo *)u;
+    size_t k = std::min(sz * n, io->body->size() - io->sent);
+    memcpy(p, io->body->data() + io->sent, k);
+    io->sent += k;
+    return k;
+}
+static size_t curl_header(char *p, size_t sz, size_t n, void *u) {
+    std::string line(p, sz * n);
+    size_t colon = line.find(':');
+    if (colon != std::string::npos) {
+        std::string v = line.substr(colon + 1);
+        while (!v.empty() && isspace((unsigned char)v.front())) v.erase(v.begin());
+        while (!v.empty() && isspace((unsigned char)v.back())) v.pop_back();
+        ((CurlIo *)u)->o->headers[s3::lower(line.substr(0, colon))] = v;
+    }
+    return sz * n;
+}
+static int curl_progress(void *u, curl_off_t dlt, curl_off_t dln, curl_off_t ult, curl_off_t uln) {
+    CurlIo *io = (CurlIo *)u;
+    curl_off_t of = io->up ? ult : dlt, n = io->up ? uln : dln;
+    if (*io->progress && of > 0) (*io->progress)((double)n / (double)of);
+    return 0;
+}
+static Resp http_send(const std::string &method, const std::string &url, const s3::Headers &headers, const std::string &body,
+                      double timeout, const Progress &progress) {
+    Resp out;
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    CURL *h = curl_easy_init();
+    if (!h) { out.error = "libcurl"; return out; }
+    CurlIo io{&out, &body, 0, &progress, method == "PUT"};
+    struct curl_slist *hl = NULL;
+    for (auto &kv : headers)
+        if (s3::lower(kv.first) != "host") hl = curl_slist_append(hl, (kv.first + ": " + kv.second).c_str());
+    hl = curl_slist_append(hl, "Expect:");  // (no 100-continue round trip)
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hl);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &io);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &io);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, curl_progress);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, &io);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)(timeout * 1000));
+    // (timeout: with nothing received for that long, as NSURLRequest's timeoutInterval; the whole transfer: 10 minutes)
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, (long)(timeout > 1 ? timeout : 1));
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 600L);
+    if (method == "PUT") {
+        curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+        curl_easy_setopt(h, CURLOPT_READFUNCTION, curl_read);
+        curl_easy_setopt(h, CURLOPT_READDATA, &io);
+        curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)body.size());
+    } else if (method == "HEAD") {
+        curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    } else if (method != "GET") {
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method.c_str());
+        if (!body.empty()) {
+            curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.data());
+            curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
+        }
+    }
+    CURLcode rc = curl_easy_perform(h);
+    if (rc != CURLE_OK) out.error = curl_easy_strerror(rc);
+    else {
+        long st = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &st);
+        out.status = (int)st;
+    }
+    curl_slist_free_all(hl);
+    curl_easy_cleanup(h);
+    return out;
+}
+#else
 static Resp http_send(const std::string &method, const std::string &url, const s3::Headers &headers, const std::string &body,
                       double timeout, const Progress &progress) {
     Resp out;
@@ -249,6 +333,7 @@ static Resp http_send(const std::string &method, const std::string &url, const s
     }
     return out;
 }
+#endif
 
 // A request to the bucket (key: an object in it, "" the bucket itself), signed. Its error: the network's, or S3's.
 static Resp request(const Conn &c, const std::string &method, const std::string &key,
@@ -659,6 +744,10 @@ static void ensure_device(void) {
     std::string name;
 #if TARGET_OS_IPHONE
     name = UIDevice.currentDevice.model.UTF8String;  // ("iPhone", "iPad": iOS doesn't tell apps the device's own name)
+#elif defined(__linux__)
+    char host[256] = "";
+    if (gethostname(host, sizeof host - 1) == 0) name = host;
+    if (name.empty()) name = "Linux";
 #else
     name = NSHost.currentHost.localizedName.UTF8String ?: "Mac";
 #endif
@@ -908,7 +997,18 @@ void cloud_restored(const fs::path &root, const fs::path &from) {
     if (snapshot(&s, &why) && s.any) state_write(root, {s.hash, time(NULL)});
 }
 
-#else  // other platforms: no cloud saves yet
+#else  // other platforms (Windows): no cloud saves yet (the menu's Saves page shows none configured)
+CloudView cloud_view(void) { return CloudView(); }
+bool cloud_connect(const std::string &connection, std::string *why) {
+    (void)connection;
+    if (why) *why = "cloud saves aren't available on this platform yet";
+    return false;
+}
+void cloud_disconnect(void) {}
+void cloud_refresh(void) {}
+void cloud_upload_now(void) {}
+void cloud_fetch(const std::string &key) { (void)key; }
+void cloud_restored(const fs::path &root, const fs::path &from) { (void)root, (void)from; }
 extern "C" void cloud_boot(void) {}
 extern "C" void cloud_save_committed(void) {}
 extern "C" void cloud_flush(void) {}

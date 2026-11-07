@@ -653,6 +653,7 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
             snprintf(xs, sizeof xs, "(vec3(%s, %s, %s) + vec3(%s) / vec3(tsize%d(%s).xyz))", co[0], co[1], co[2], off, slot, L);
         else if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
+        if (!layer) { char w[1700]; snprintf(w, sizeof w, "nn3(%s)", xs); strcpy(xs, w); }  // (NaN: 0, as MSL's nn3)
     }
     const char *extra = NULL;  // separate compare argument (cube array shadow)
     if (!t->shadow) {
@@ -1011,7 +1012,6 @@ static void emit_tld4(Ctx *c, uint64_t w) {
     uint32_t mask = (uint32_t)bits(w, 31, 4);
     int comp = (int)bits(w, 56, 2), offmode = (int)bits(w, 54, 2);
     bool dc = bits(w, 50, 1);
-    if (c->glsl) { fail(c, "tld4: glsl"); return; }
     if (offmode == 2) { fail(c, "tld4: per-texel offsets"); return; }
     if (ttype != 2 && ttype != 3 && ttype != 6 && ttype != 7) { fail(c, "tld4: dimension %d", ttype); return; }
     bool array = ttype & 1, cube = ttype >= 6;
@@ -1020,6 +1020,29 @@ static void emit_tld4(Ctx *c, uint64_t w) {
     int u = array ? a + 1 : a, n = cube ? 3 : 2, pb = b;
     char coord[256], layer[96] = "", off[128] = "", dref[64] = "";
     for (int i = u; i < u + n; i++) c->reg_used[i] = 1;
+    if (c->glsl) {  // textureGather[Offset](sampler, P[, refZ][, offset][, comp]): the layer is P's last component
+        char P[512], call[1024];
+        if (cube) sprintf(coord, "nn3(vec3(as_f(r%d), as_f(r%d), as_f(r%d)))", u, u + 1, u + 2);
+        else if (c->stage != STAGE_VERTEX) {
+            c->uses_rscale = true;
+            sprintf(coord, "uvs(vec2(as_f(r%d), as_f(r%d)), rscale[%d])", u, u + 1, slot + 1);
+        } else sprintf(coord, "vec2(as_f(r%d), as_f(r%d))", u, u + 1);
+        if (array) {
+            c->reg_used[a] = 1;
+            sprintf(P, "vec%d(%s, float(min(uint(r%d), uint(tsize%d(0).z) - 1u)))", n + 1, coord, a, slot);
+        } else strcpy(P, coord);
+        if (offmode == 1 && !cube) {
+            c->reg_used[pb] = 1;
+            sprintf(off, "ivec2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pb, pb);
+            pb++;
+        }
+        if (dc) { c->reg_used[pb] = 1; sprintf(dref, "as_f(r%d)", pb); }
+        if (dc) sprintf(call, off[0] ? "textureGatherOffset(t%d, %s, %s, %s)" : "textureGather(t%d, %s, %s%s)", slot, P, dref, off);
+        else if (off[0]) sprintf(call, "textureGatherOffset(t%d, %s, %s, %d)", slot, P, off, comp);
+        else sprintf(call, "textureGather(t%d, %s, %d)", slot, P, comp);
+        write_tex_result(c, slot, call, mask, d, RZ, false, false);
+        return;
+    }
     if (array) { c->reg_used[a] = 1; sprintf(layer, ", min(uint(r%d), t%d.get_array_size() - 1u)", a, slot); }
     if (cube) sprintf(coord, "float3(as_type<float>(r%d), as_type<float>(r%d), as_type<float>(r%d))", u, u + 1, u + 2);
     else {
@@ -1048,12 +1071,23 @@ static void emit_tld4s(Ctx *c, uint64_t w) {
     uint32_t index = (uint32_t)bits(w, 36, 13);
     bool dc = bits(w, 50, 1), aoffi = bits(w, 51, 1), f16 = bits(w, 55, 1);
     int comp = (int)bits(w, 52, 2);
-    if (c->glsl) { fail(c, "tld4s: glsl"); return; }
     int slot = tex_slot(c, index, TEXTYPE_2D, dc, false);
     char coord[256], off[128] = "", dref[64] = "";
     int ua = a, va = (aoffi || dc) ? a + 1 : b, pb = b;
     c->reg_used[ua] = c->reg_used[va] = 1;
     c->uses_rscale = true;
+    if (c->glsl) {
+        char call[1024];
+        sprintf(coord, c->stage != STAGE_VERTEX ? "uvs(vec2(as_f(r%d), as_f(r%d)), rscale[%d])" : "vec2(as_f(r%d), as_f(r%d))",
+                ua, va, slot + 1);
+        if (aoffi) { c->reg_used[pb] = 1; sprintf(off, "ivec2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pb, pb); pb++; }
+        if (dc) { c->reg_used[pb] = 1; sprintf(dref, "as_f(r%d)", pb); }
+        if (dc) sprintf(call, off[0] ? "textureGatherOffset(t%d, %s, %s, %s)" : "textureGather(t%d, %s, %s%s)", slot, coord, dref, off);
+        else if (off[0]) sprintf(call, "textureGatherOffset(t%d, %s, %s, %d)", slot, coord, off, comp);
+        else sprintf(call, "textureGather(t%d, %s, %d)", slot, coord, comp);
+        write_tex_result(c, slot, call, 0xF, d0, d1, true, f16);
+        return;
+    }
     sprintf(coord, c->stage != STAGE_VERTEX ? "uvs(float2(as_type<float>(r%d), as_type<float>(r%d)), rscale[%d])"
                                             : "float2(as_type<float>(r%d), as_type<float>(r%d))", ua, va, slot + 1);
     if (aoffi) { c->reg_used[pb] = 1; sprintf(off, ", int2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pb, pb); pb++; }
@@ -1726,8 +1760,27 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int64_t off = sbits(w, 28, 20);
         bool wide = bits(w, 48, 1);
         int vb = (int)bits(w, 0, 8);
-        if (c->glsl) { fail(c, "red: glsl"); }
-        else if (!(size == 0 || size == 1 || (size == 3 && op == 0)) || op == 3 || op == 4) { fail(c, "red size %d op %d", size, op); }
+        if (!(size == 0 || size == 1 || (size == 3 && op == 0)) || op == 3 || op == 4) { fail(c, "red size %d op %d", size, op); }
+        else if (c->glsl) {  // (every layout of the heap has a 32-bit compare-and-swap, GMCAS: each op is a CAS loop on it)
+            c->info->uses_gmem = true;
+            c->uses_gmem_store = true;
+            c->info->uses_gmem_store = true;
+            char addr[256], nv[160];
+            if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+            else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+            else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+            switch (op) {
+            case 0: strcpy(nv, size == 3 ? "floatBitsToUint(uintBitsToFloat(o) + uintBitsToFloat(v))" : "o + v"); break;
+            case 1: strcpy(nv, size == 1 ? "uint(min(int(o), int(v)))" : "min(o, v)"); break;
+            case 2: strcpy(nv, size == 1 ? "uint(max(int(o), int(v)))" : "max(o, v)"); break;
+            case 5: strcpy(nv, "o & v"); break;
+            case 6: strcpy(nv, "o | v"); break;
+            default: strcpy(nv, "o ^ v"); break;
+            }
+            sp(&c->body, "    { ulong ga = %s - 0x%llxul;\n", addr, (unsigned long long)maxwell_gmem_base);
+            sp(&c->body, "      if (ga < 0x%llxul) { uint gi = uint(ga >> 2), v = %s, o = GMR(gi);\n", (unsigned long long)maxwell_gmem_size, R(vb));
+            sp(&c->body, "        for (int k = 0; k < 64; k++) { uint p = GMCAS(gi, o, %s); if (p == o) break; o = p; } } }\n", nv);
+        }
         else {
             c->info->uses_gmem = true;
             c->uses_gmem_store = true;
@@ -1872,8 +1925,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE: all / any / eq of a predicate over the warp
         int pa = (int)bits(w, 39, 3), pb = (int)bits(w, 45, 3), op = (int)bits(w, 48, 2);
         const char *v = P(pa, bits(w, 42, 1));
-        if (c->glsl) { fail(c, "vote: glsl"); }
-        else {
+        if (c->glsl) {  // (GL_KHR_shader_subgroup_vote / _ballot: a subgroup is the 32-wide warp on NVIDIA; ballot's low word)
+            sp(&c->body, "    { bool vp = %s;\n", v);
+            if (pb != PT) {
+                c->pred_used[pb] = 1;
+                sp(&c->body, op == 0 ? "      p%d = subgroupAll(vp);\n" : op == 1 ? "      p%d = subgroupAny(vp);\n"
+                                                                     : "      p%d = subgroupAllEqual(vp);\n", pb);
+            }
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = subgroupBallot(vp).x;\n", d); }
+            sp(&c->body, "    }\n");
+        } else {
             sp(&c->body, "    { bool vp = %s;\n", v);
             if (pb != PT) {
                 c->pred_used[pb] = 1;
@@ -2191,6 +2252,8 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
+    "#extension GL_KHR_shader_subgroup_vote : require\n"
+    "#extension GL_KHR_shader_subgroup_ballot : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
@@ -2220,7 +2283,12 @@ static const char glsl_prelude[] =
     "float fswzadd(float a, float b, uint swz, uint lane) { uint m = (swz >> ((lane & 3u) * 2u)) & 3u; float ma = m == 1u ? -1.0f : (m == 3u ? 0.0f : 1.0f); float mb = m == 2u ? -1.0f : 1.0f; return a * ma + b * mb; }\n"
     "uvec2 rsc(uvec2 c, vec4 s) { return (s.x == 1.0f && s.y == 1.0f) ? c : uvec2(floor((vec2(c) + 0.5f) * s.xy)); }\n"
     // a scaled texture whose contents occupy its top-left part (Dynamic resolution): sample that part
-    "vec2 uvs(vec2 uv, vec4 s) { return (s.z == 1.0f && s.w == 1.0f) ? uv : min(uv, 1.0f) * s.zw; }\n";
+    "vec2 uvs(vec2 uv, vec4 s) { uv = mix(uv, vec2(0.0f), isnan(uv)); return (s.z == 1.0f && s.w == 1.0f) ? uv : min(uv, 1.0f) * s.zw; }\n"
+    // FMUL / FFMA .FMZ (D3D9-style): a zero factor gives zero whatever the other one is (inf, NaN)
+    "float fmz(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n"
+    "float ffmz(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c + 0.0f : fma(a, b, c); }\n"
+    // (the GPU's texture units read a NaN coordinate as 0; desktop samplers' behaviour is undefined)
+    "vec3 nn3(vec3 v) { return mix(v, vec3(0.0f), isnan(v)); }\n";
 // The half <-> float helpers (glsl_finish: glsl_h2f_exact or glsl_h2f_native, then glsl_prelude_half).
 // Half -> float in vertex (and other pre-raster) shaders: by bits, not unpackHalf2x16. NVIDIA's driver recognises
 // unpacked halves and runs some of the fp32 math after them in native fp16, differently per shader, so a depth
@@ -2299,7 +2367,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "#define GMR(i) gmem_.w[i]\n");
         if (c->uses_gmem_store)
             sp(&s, "#define GMW(i, v) gmem_.w[i] = (v)\n#define GMAND(i, m) atomicAnd(gmem_.w[i], m)\n"
-                   "#define GMOR(i, m) atomicOr(gmem_.w[i], m)\n");
+                   "#define GMOR(i, m) atomicOr(gmem_.w[i], m)\n#define GMCAS(i, c, v) atomicCompSwap(gmem_.w[i], c, v)\n");
     } else if (info->uses_gmem && !maxwell_gmem_lazy) {  // the heap in windows, one binding each, plain branches (shader.h)
         int n = maxwell_gmem_chunks(), ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
         for (int k = 0; k < n; k++)
@@ -2320,7 +2388,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 }
                 sp(&s, "}\n");
             }
-            sp(&s, "#define GMW(i, v) GMW_(i, v)\n#define GMAND(i, m) GMAND_(i, m)\n#define GMOR(i, m) GMOR_(i, m)\n");
+            sp(&s, "uint GMCAS_(uint i, uint cmp, uint v) { uint c = i >> %du, o = i & 0x%xu;\n", ws, (1u << ws) - 1);
+            for (int k = 0; k < n; k++) sp(&s, "  if (c == %du) return atomicCompSwap(gmem%d_.w[o], cmp, v);\n", k, k);
+            sp(&s, "  return cmp; }\n");
+            sp(&s, "#define GMW(i, v) GMW_(i, v)\n#define GMAND(i, m) GMAND_(i, m)\n#define GMOR(i, m) GMOR_(i, m)\n"
+                   "#define GMCAS(i, c, v) GMCAS_(i, c, v)\n");
         }
     } else if (info->uses_gmem) {  // chunks imported lazily: a table of device addresses, buffer references (shader.h)
         int ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
@@ -2361,6 +2433,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             {"void GMW4(uint i, uvec4 v)", "p.w[o] = v.x; p.w[o + 1u] = v.y; p.w[o + 2u] = v.z; p.w[o + 3u] = v.w; return;", "", 3, true},
             {"void GMAND1(uint i, uint v)", "atomicAnd(p.w[o], v); return;", "", 0, true},
             {"void GMOR1(uint i, uint v)", "atomicOr(p.w[o], v); return;", "", 0, true},
+            {"uint GMCAS1(uint i, uint cmp, uint v)", "return atomicCompSwap(p.w[o], cmp, v);", "return cmp;", 0, true},
         };
         for (int f = 0; f < (int)(sizeof fn / sizeof fn[0]); f++) {
             if (fn[f].store && !c->uses_gmem_store) continue;
@@ -2381,7 +2454,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                        "gmiss(c, i); %s }\n", lim, fn[f].act, fn[f].miss);
         }
         sp(&s, "#define GMR(i) GMR1(i)\n");
-        if (c->uses_gmem_store) sp(&s, "#define GMW(i, v) GMW1(i, v)\n#define GMAND(i, m) GMAND1(i, m)\n#define GMOR(i, m) GMOR1(i, m)\n");
+        if (c->uses_gmem_store)
+            sp(&s, "#define GMW(i, v) GMW1(i, v)\n#define GMAND(i, m) GMAND1(i, m)\n#define GMOR(i, m) GMOR1(i, m)\n"
+                   "#define GMCAS(i, c, v) GMCAS1(i, c, v)\n");
     }
     if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
         sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);

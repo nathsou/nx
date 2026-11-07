@@ -1,9 +1,9 @@
 # nx
 
 A static recompilation engine for **Nintendo Switch** games, producing native **macOS** applications (Apple Silicon,
-Metal). A game's own ARM64 code is translated to C ahead of time and compiled for your Mac; the Switch's operating
-system, GPU API (NVN), audio, video decoding and input are replaced by host implementations. It is not an emulator:
-the game runs as a native program.
+Metal) and **Linux** ones (x86-64, Vulkan). A game's own ARM64 code is translated to C ahead of time and compiled for
+your machine; the Switch's operating system, GPU API (NVN), audio, video decoding and input are replaced by host
+implementations. It is not an emulator: the game runs as a native program.
 
 | Game | Versions | State |
 |---|---|---|
@@ -44,11 +44,20 @@ profile under `games/<id>/` adds what a game needs on top (see [Adding a game](#
   audio and controls. See [Settings and the menu](#settings-and-the-menu).
 - **Game updates** are applied when extracting (`--update`): the update's code and its romfs patch over the base
   game's.
-- Not done: online features, Linux and Windows (the Vulkan backend from LASRecomp is there but has not been built).
+- **Linux** (x86-64, Vulkan): both games run, with the same menu, saves and cloud saves. Metroid Dread plays at the
+  display's rate (checked at 4K internal resolution on an RTX 4060 Ti: about 5 ms of GPU and 4 ms of render thread a
+  frame), Animal Crossing at its 30 fps through the whole intro to the island. Not there yet: frame generation (Metal
+  only). See [docs/linux.md](docs/linux.md).
+- **Mario Tennis Aces** (no address tables, a profile for its font): boots to its title screen at 60 fps with sound,
+  then runs out of memory in its own allocator when the menu loads (not investigated further yet).
+- Not done: online features, Windows (shares the Vulkan backend with Linux, not built or tried yet).
 
 See [PLAN.md](PLAN.md) for the design, the full status and the known problems.
 
 ## Building
+
+On Linux, see [docs/linux.md](docs/linux.md) for the packages; the steps below are the same (`make -j$(nproc)`, and the
+game's library is `build/<name>/game.so`).
 
 Requirements: an Apple Silicon Mac, Xcode command line tools, [Homebrew](https://brew.sh) `llvm` (clang), `sdl3`,
 `ffmpeg`, `zstd`, Python 3 and [Bun](https://bun.sh) (only for extracting games).

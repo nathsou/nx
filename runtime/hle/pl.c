@@ -26,6 +26,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "../game.h"
 #include "../hle.h"
 #include "../paths.h"
 
@@ -255,7 +256,9 @@ static void load_fonts(void) {
     static const char *const ext[] = {"fonts/nintendo_ext_003.bfttf", "fonts/nintendo_ext_003.ttf", NULL};
     static const char *const *const chains[N_FONT_TYPES] = {std, zh_cn, zh_cn_ext, zh_tw, ko, ext};
     extern const char *settings_language(void);
-    bool cyrillic = !strcmp(settings_language(), "ru");
+    // (the Japanese gothics are passed over in Russian - their Cyrillic is full-width - and for a game whose font engine
+    // can't use them: Mario Tennis Aces crashed at its first text on BIZ UDPGothic, game.h GAME_LATIN_SYSTEM_FONT)
+    bool cyrillic = !strcmp(settings_language(), "ru") || game_flag(GAME_LATIN_SYSTEM_FONT);
     char bundled[1100];
     for (int t = 0; t < N_FONT_TYPES; t++) {
         if (env) load_one(env, &fonts[t]);  // (a forced font: it is what the player asked for, in any language)

@@ -58,6 +58,47 @@ static void rtld_init_sdk(Cpu *c) {  // the SDK, then the subsdks (built on it),
 }
 static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 static void rtld_init_all(Cpu *c) { rtld_init_sdk(c); rtld_init_main(c); }
+
+// What nn::init::Start does with each callback (x2, x3, x4), read from its own code: the callbacks' order against its
+// calls to nninitStartup and nnMain (through PLT stubs) differs between SDK versions. Mario Tennis Aces's (two
+// callbacks) calls x3 after nninitStartup, before nnMain - main's constructors, which allocate from the heap
+// nninitStartup sets up - where SDK 9's (two) calls it after nnMain (the fini arrays). Each callback is classed:
+// 0 not called, 1 before nninitStartup, 2 between it and nnMain, 3 after nnMain. false: the code isn't understood.
+static bool init_start_order(uint64_t start, int cls[3]) {
+    uint64_t startup = loader_find_symbol("nninitStartup"), nnmain = loader_find_symbol("nnMain");
+    if (!startup || !nnmain) return false;
+    int reg_cb[32];  // the callback a register holds (-1: none)
+    for (int i = 0; i < 32; i++) reg_cb[i] = -1;
+    reg_cb[2] = 0, reg_cb[3] = 1, reg_cb[4] = 2;
+    int stage = 1;  // 1 before nninitStartup, 2 after it, 3 after nnMain
+    bool saw_main = false;
+    cls[0] = cls[1] = cls[2] = 0;
+    for (uint64_t pc = start; pc < start + 0x200; pc += 4) {
+        uint32_t w = *(const uint32_t *)(uintptr_t)pc;
+        if ((w & 0xFFE0FFE0) == 0xAA0003E0) {  // mov xd, xm
+            int d = w & 31, m = (w >> 16) & 31;
+            reg_cb[d] = reg_cb[m];
+        } else if ((w & 0xFFFFFC1F) == 0xD63F0000) {  // blr xn
+            int cb = reg_cb[(w >> 5) & 31];
+            if (cb >= 0 && !cls[cb]) cls[cb] = stage;
+        } else if ((w & 0xFC000000) == 0x94000000) {  // bl: a PLT stub (adrp x16; ldr x17, [x16, #off]; ...; br x17)
+            uint64_t t = pc + (uint64_t)((int64_t)((int32_t)(w << 6) >> 6) * 4);
+            uint32_t w0 = *(const uint32_t *)(uintptr_t)t, w1 = *(const uint32_t *)(uintptr_t)(t + 4);
+            if ((w0 & 0x9F00001F) != 0x90000010 || (w1 & 0xFFC003FF) != 0xF9400211) continue;
+            int64_t imm = ((int64_t)(((w0 >> 5) & 0x7FFFF) << 2 | ((w0 >> 29) & 3)) << 44) >> 32;  // (page offset, signed)
+            uint64_t got = (t & ~0xFFFull) + (uint64_t)imm + ((w1 >> 10) & 0xFFF) * 8;
+            uint64_t target = *(const uint64_t *)(uintptr_t)got;
+            if (target == startup && stage == 1) stage = 2;
+            else if (target == nnmain) { stage = 3; saw_main = true; }
+        } else if (w == 0xD65F03C0 || (w & 0xFC000000) == 0x14000000) {
+            break;  // ret / a tail call: the end
+        } else {  // any other write to a register drops what it held (the common forms: data processing, loads)
+            int d = w & 31;
+            if (((w >> 26) & 7) == 4 || ((w >> 25) & 7) == 5 || ((w >> 22) & 0x3FF) == 0x3E5) reg_cb[d] = -1;
+        }
+    }
+    return saw_main && cls[0];
+}
 static void rtld_fini(Cpu *c) {
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
@@ -215,14 +256,29 @@ static void boot(const char *root) {
     if (getenv("LARECOMP_WATCH_EARLY")) { extern void watch_arm(void); watch_arm(); }  // (debug: the watch from boot)
     uint64_t fini = hle_register("<rtld_fini>", rtld_fini);
     uint64_t start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");  // (SDK 11)
+    uint64_t start2 = start ? 0 : loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_");  // (older SDKs: two callbacks)
     KThread *t;
-    if (start) {
+    int cls[3];
+    if ((start || start2) && init_start_order(start ? start : start2, cls)) {
+        // each callback by its place: before nninitStartup the SDK's constructors (every module's when nothing runs
+        // between nninitStartup and nnMain), between the two main's, after nnMain the fini arrays
+        bool premain = cls[0] == 2 || cls[1] == 2 || cls[2] == 2;
+        uint64_t cb[3] = {0, 0, 0};
+        static const char *const what[] = {"-", "the SDK's constructors", "main's constructors", "the fini arrays"};
+        for (int i = 0; i < 3; i++)
+            cb[i] = cls[i] == 1 ? (premain ? hle_register("<rtld_init_sdk>", rtld_init_sdk) : hle_register("<rtld_init_all>", rtld_init_all))
+                  : cls[i] == 2 ? hle_register("<rtld_init_main>", rtld_init_main) : cls[i] == 3 ? fini : 0;
+        LOG("[boot] nn::init::Start (%s callbacks): x2 %s, x3 %s, x4 %s\n", start ? "three" : "two",
+            cls[0] == 1 && !premain ? "every module's constructors" : what[cls[0]], what[cls[1]], what[cls[2]]);
+        t = kernel_create_main_thread(start ? start : start2, stack_size, prio, core);
+        kernel_run_main(t, t->handle, 0, cb[0], cb[1], cb[2]);
+    } else if (start) {
         uint64_t init_sdk = hle_register("<rtld_init_sdk>", rtld_init_sdk);
         uint64_t init_main = hle_register("<rtld_init_main>", rtld_init_main);
         t = kernel_create_main_thread(start, stack_size, prio, core);
         // nn::init::Start(thread_handle, args_region, init_sdk, init_main, fini)
         kernel_run_main(t, t->handle, 0, init_sdk, init_main, fini);
-    } else if ((start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_"))) {  // (older SDKs: two callbacks)
+    } else if ((start = start2)) {  // (older SDKs: two callbacks)
         uint64_t init_all = hle_register("<rtld_init_all>", rtld_init_all);
         t = kernel_create_main_thread(start, stack_size, prio, core);
         kernel_run_main(t, t->handle, 0, init_all, fini, 0);

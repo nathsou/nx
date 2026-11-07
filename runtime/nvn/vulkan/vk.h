@@ -101,6 +101,7 @@ typedef struct TexBackend {
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
     uint64_t touched_frame, frame_cleared;
+    uint64_t drawn_frame;  // (renderer_texture_note_drawn) the frame it was last drawn into + 1
     uint32_t level_gen;
     float sx, sy;        // the scale the contents were drawn at (scalable textures)
     float ax, ay;        // the allocation scale (the image's size; Dynamic: the contents use a part of it)
