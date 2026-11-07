@@ -44,9 +44,14 @@ NVN(nvnDeviceInitialize) {
     if (!once) {
         once = true;
         rq_hang_watch_start();  // (before anything of the renderer can hang: rqueue.c)
+        // (host work of seconds - the device, the shader preparation - touching no guest state: the core goes to the
+        // other threads of the caller's core meanwhile, or the more urgent ones waited 1 s for it, kernel.c)
+        extern void kernel_block_begin(void), kernel_sched_point(void);
+        kernel_block_begin();
         backend_init();
         extern void shader_prep_boot(const char *romfs);
         shader_prep_boot(g_romfs_dir);  // (LARECOMP_SHADER_PREP=1, tests: what the start screen's setup does)
+        kernel_sched_point();
     }
     LOG("[nvn] device initialized\n");
     RET(1);
