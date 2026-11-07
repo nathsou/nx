@@ -43,6 +43,10 @@ typedef struct GameProfile {
 // display's refresh rate (Dread: 120 fps on a 120 Hz Mac). Without it, a frame is shown no sooner than its interval
 // of 60 Hz vsyncs after the last, as on the Switch: games that step per frame (ACNH, 30 fps: interval 2) play at speed.
 #define GAME_UNCAPPED_FPS 2u
+// The shared system font's stand-in (runtime/hle/pl.c, without the console's own fonts) is a Latin one - Arial, DejaVu
+// Sans - not a Japanese gothic: Mario Tennis Aces's font engine finds no glyph for its fallback character in BIZ
+// UDPGothic (Linux's default) and crashes at its first text.
+#define GAME_LATIN_SYSTEM_FONT 4u
 static inline bool game_flag(uint32_t f);
 
 typedef struct GameInfo {

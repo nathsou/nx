@@ -10,8 +10,14 @@ recompiled from your own game files exactly as on macOS. Only the host side diff
   at run time (cached in `cache/`).
 - **Window, input, audio:** SDL3, on Wayland or X11.
 
-Checked on: CachyOS (Arch), Intel Core i5-12600K, NVIDIA GeForce RTX 4060 Ti (driver 615), KDE Plasma (Wayland).
-Metroid Dread 1.0.0 and Animal Crossing: New Horizons 1.0.0.
+Checked on: CachyOS (Arch), Intel Core i5-12600K, NVIDIA GeForce RTX 4060 Ti (driver 615), KDE Plasma, through
+XWayland (`SDL_VIDEO_DRIVER=x11`); SDL's native Wayland path hasn't been run yet.
+- Metroid Dread 1.0.0: save checkpoints across the game (Artaria, Cataris, Ghavoran) load and play; at 4K internal
+  resolution a frame takes about 5 ms of GPU and 4 ms of the render thread. All 832 shader stages compile.
+- Animal Crossing: New Horizons 1.0.0: the intro (Timmy and Tommy, the name entry with the game's own keyboard, the
+  character creator), the opening movie and the arrival on the island, at a steady 30 fps.
+- Mario Tennis Aces 1.0.0 (games/mta: no patches, a Latin stand-in for the system font): its title screen at 60 fps
+  with sound; it then runs out of memory in its own allocator as the menu loads.
 
 ## Building
 
@@ -45,9 +51,10 @@ make -j$(nproc) GAME=dread
 ./build/nx data/dread
 ```
 
-The game's library is `build/<name>/game.so`. The first build of a game takes a while: Metroid Dread's 460 MB of C
-compiled in about 40 minutes on a 12600K. One of its functions alone takes several minutes (LLVM's LICM pass on a
-very large function). Later builds only recompile what changed.
+The game's library is `build/<name>/game.so`. The first build of a game takes a while (Metroid Dread's 460 MB of C:
+about 40 minutes on a 12600K shared with other work); later builds only recompile what changed. The game code is
+built with LLVM's LICM scalar promotion off (`GENOPT` in the Makefile): it promotes next to nothing in lifted code and
+spent most of the build on a few very large functions (one of Mario Tennis Aces's: over 45 minutes, 218 s without it).
 
 ## Shaders
 

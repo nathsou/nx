@@ -997,7 +997,18 @@ void cloud_restored(const fs::path &root, const fs::path &from) {
     if (snapshot(&s, &why) && s.any) state_write(root, {s.hash, time(NULL)});
 }
 
-#else  // other platforms (Windows): no cloud saves yet
+#else  // other platforms (Windows): no cloud saves yet (the menu's Saves page shows none configured)
+CloudView cloud_view(void) { return CloudView(); }
+bool cloud_connect(const std::string &connection, std::string *why) {
+    (void)connection;
+    if (why) *why = "cloud saves aren't available on this platform yet";
+    return false;
+}
+void cloud_disconnect(void) {}
+void cloud_refresh(void) {}
+void cloud_upload_now(void) {}
+void cloud_fetch(const std::string &key) { (void)key; }
+void cloud_restored(const fs::path &root, const fs::path &from) { (void)root, (void)from; }
 extern "C" void cloud_boot(void) {}
 extern "C" void cloud_save_committed(void) {}
 extern "C" void cloud_flush(void) {}

@@ -494,3 +494,23 @@ XCIs, from the card header's last valid page, listing how much of each NCA is pr
 - Donkey Kong Country: Tropical Freeze (419 of 7,192 MiB), Game Builder Garage (788 of 1,356 MiB) and Tomodachi
   Life: Living the Dream (152 of 6,737 MiB): XCIs cut short inside their Program NCA. Like most program NCAs, theirs
   keep the exefs section last, after the romfs, so even the code is missing.
+
+## 8. Linux (Vulkan)
+
+The Vulkan backend vendored from LASRecomp builds on Linux (x86-64: the lifter's portable SIMD) and runs Dread and
+ACNH (docs/linux.md). What it needed beyond building:
+- The Metal backend's fixes since the vendoring, ported: conditional rendering, depth-only pipelines (Dread's prepass),
+  3D render targets, one-shot targets waiting for their shaders, scaled-target promotion, linear render target
+  write-back, virtual pools inside the GPU's span, and the GLSL side of the translator (FMZ, NaN coordinates, TLD4 /
+  TLD4S, VOTE, RED). `tools/shader_corpus_vk.c` compiles a game's every shader through shaderc (`make corpus`).
+- The in-game menu (menu.mm, ImGui's Vulkan backend through device.c's overlay) and cloud saves (libcurl).
+- Kernel: an IPC request frees its thread's emulated core while it is handled, as a blocked SendSyncRequest does on
+  the Switch. Holding it starved ACNH's main thread behind a file-reading thread on core 0, while a worker on core 1
+  used a manager not yet initialised: a boot crash in 3 of 5 boots on a loaded machine.
+- Boot: nn::init::Start's callbacks are classed from its own code (before nninitStartup, between it and nnMain, after
+  nnMain). ACNH's and Mario Tennis Aces's SDK (two callbacks) calls the second before nnMain: main's constructors.
+  It had been run as the fini arrays (after nnMain on SDK 9), so these games had their main constructors run before
+  their heap existed (Mario Tennis: a crash in operator new) and their static destructors before nnMain.
+- Audio renderer: render info (the elapsed frame count) only from REV5 (Mario Tennis Aces is REV4 and aborted on it).
+- Mario Tennis Aces: a profile with GAME_LATIN_SYSTEM_FONT (its font engine finds no glyph in BIZ UDPGothic, the
+  bundled Japanese stand-in); it reaches its title screen, then its own allocator runs out of memory loading the menu.

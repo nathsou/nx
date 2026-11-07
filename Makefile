@@ -115,6 +115,11 @@ ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
 endif
 GENFLAGS += $(GENARCH) -fPIC
+# LLVM's LICM spends most of an -O1 build of the few very large guest functions in its scalar promotion (a 13,900-line
+# function of Mario Tennis Aces: over 45 minutes, 218 s without it; Metroid Dread's largest: 335 s, 91 s). It promotes
+# next to nothing in lifted code (guest stores may alias the Cpu struct: -fno-strict-aliasing), so it is off. Not part of
+# GAMELIB_ID (the code is compatible either way): GENOPT=  builds with it again.
+GENOPT   ?= -mllvm -disable-licm-promotion
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
 # shaderc as the system's pkg-config file names it (Arch / Fedora / AOSC ship only libshaderc_shared, issue #22);
 # without one -lshaderc (Debian / Ubuntu's libshaderc.so). SHADERC=... overrides it.
@@ -172,7 +177,7 @@ all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
 $(GB)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
 	@mkdir -p $(dir $@)
-	@$(CC) $(GENFLAGS) -c $< -o $@
+	@$(CC) $(GENFLAGS) $(GENOPT) -c $< -o $@
 
 # (the id in a file that changes only when the id does: make doesn't see a changed -D value)
 $(B)/gamelib_id.stamp: FORCE
