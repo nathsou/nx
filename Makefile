@@ -110,7 +110,7 @@ GAMELIB  := $(GB)/game.dylib
 GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup  # (the runtime functions it calls: the app's own)
 else ifeq ($(PLATFORM),linux)
 EXE      := $(B)/nx
-DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
+DEPINC   := $(if $(DEPS),-I$(DEPS)/include) -isystem third_party/vma  # (Vulkan Memory Allocator: a system copy wins, vma.cpp)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
 endif
@@ -121,7 +121,7 @@ OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the 
 SHADERC  ?= $(shell pkg-config --libs shaderc 2>/dev/null || echo -lshaderc)
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
 LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd \
-            -lvulkan $(SHADERC) -lpthread -ldl -lm
+            -lvulkan $(SHADERC) -lcurl -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
@@ -283,10 +283,18 @@ build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime
 
 # Every shader the game ships (romfs/system/shd), translated and compiled with Metal: no game needed to run
 # (tools/shader_corpus.m). `make corpus` (MSL + Metal) - add CORPUS_ARGS=--glsl for the Vulkan GLSL translation.
+ifeq ($(PLATFORM),macos)
 build/shader_corpus: tools/shader_corpus.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/yaz0.h
 	@mkdir -p $(dir $@)
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -Iruntime/nvn/maxwell -Iruntime/nvn -I/opt/homebrew/opt/zstd/include \
 	    tools/shader_corpus.m runtime/nvn/maxwell/translate.c -o $@ -L/opt/homebrew/opt/zstd/lib -lzstd
+else
+# (Linux / Windows: the Vulkan backend's GLSL, compiled to SPIR-V with shaderc: tools/shader_corpus_vk.c)
+build/shader_corpus: tools/shader_corpus_vk.c runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/yaz0.h
+	@mkdir -p $(dir $@)
+	$(CC) -O1 -Iruntime/nvn/maxwell -Iruntime/nvn $(DEPINC) tools/shader_corpus_vk.c runtime/nvn/maxwell/translate.c -o $@ \
+	    $(if $(DEPS),-L$(DEPS)/lib) -lzstd $(SHADERC) -lm
+endif
 # Then the game's prepared pipelines into its Metal binary archive (cache/<game>/shaders.metalarchive: nx in
 # preparation-only mode, games/<id>/shader_variants.txt and the shaders found in the game files), which the game loads.
 # (the archive is built even when the check finds shaders it can't translate - ACNH's agl debug shaders - and corpus

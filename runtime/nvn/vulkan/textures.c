@@ -248,6 +248,20 @@ bool renderer_texture_level_fresh(NvnTexture *t) {
     return fresh;
 }
 
+// Draws whose target the game draws every frame may be skipped while their shaders compile (a frame without them);
+// a target not drawn the frame before (drawn once: ACNH's sky panorama at boot, the colour LUT; or for the first
+// time) would keep the gap for good, so those draws wait for their shaders (exec.c draw_, as renderer.m).
+bool renderer_texture_drawn_lately(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    extern uint64_t renderer_exec_frame(void);
+    return b && b->drawn_frame && b->drawn_frame + 1 >= renderer_exec_frame() + 1;
+}
+void renderer_texture_note_drawn(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    extern uint64_t renderer_exec_frame(void);
+    if (b) b->drawn_frame = renderer_exec_frame() + 1;
+}
+
 void renderer_texture_mark_presented(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (b) b->presented = true;
@@ -380,6 +394,8 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    // 3D render targets (ACNH's colour-grading LUT, drawn slice by slice): 2D views of a depth slice (vk_view)
+    if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     // g_vk.lean_usage (integrated GPUs): colour images may only be viewed as their own format and its sRGB / UNORM
     // twin, listed in a VkImageFormatListCreateInfo (no twin: not mutable at all). Mesa's AMD / Intel drivers keep
     // DCC / CCS compression for such images; with MUTABLE_FORMAT and no list they turn it off. Views in any other
@@ -518,11 +534,36 @@ static TexBackend *tex_backend(NvnTexture *t) {
     return b;
 }
 
+// A texture tex_scalable left at its guest size (no compressible flag: an R8 mask, ACNH's depth-of-field weights) drawn
+// into in one pass with scaled attachments of its size, or given to an NVN window: it becomes scalable, reallocated at
+// the output scale (its contents start cleared: GPU-drawn targets). Same rule as metal.m's; a pass's render area is the
+// smallest of its attachments, so without it the pass covered the top-left 1 / scale of the others.
+bool renderer_texture_promote_scalable(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    if (!b || b->scalable || t->target != 1 || t->samples > 1 || t->width < 32 || t->height < 16 || getenv("LARECOMP_NO_SCALE"))
+        return false;
+    float a = (float)t->width / (float)t->height;
+    if (a <= 1.74f || a >= 1.81f) return false;
+    static int nlog;
+    if (nlog++ < 10) LOG("[vk] texture %ux%u fmt %#x (%s): drawn with scaled targets, now scaled too\n", t->width, t->height,
+                         t->format, t->label);
+    destroy_image(b);
+    b->scalable = true;
+    create_image(t, b);
+    b->uploaded = false;
+    return true;
+}
+
+// (Metal's binary archive; Vulkan's pipeline cache is saved as it goes: vk_pipeline_cache_save)
+void renderer_archive_flush(void) { vk_pipeline_cache_save(); }
+
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
         vk_alias_texture_destroyed(t);
+        extern void vk_linear_drawn_forget(NvnTexture *t);  // (exec.c: linear targets waiting for their write-back)
+        vk_linear_drawn_forget(t);
         live_remove(b);
         destroy_image(b);
         free(b->pending_rgba);
@@ -935,9 +976,14 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (ly0 >= b->layers) ly0 = b->layers - 1;
     if (ly0 + nly > b->layers) nly = b->layers - ly0;
     if (render) {
-        VkImageViewType type = b->base_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-        if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) return VK_NULL_HANDLE;  // (3D render targets: not used by the game)
-        return vk_image_view(b, type, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
+        if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) {  // (a 3D target's layer is a depth plane: a 2D view of that slice)
+            uint32_t d = b->depth >> lv0;
+            if (!d) d = 1;
+            uint32_t slice = v && (v->setmask & 2) ? v->min_layer : 0;
+            if (slice >= d) slice = d - 1;
+            return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, fmt, lv0, 1, slice, 1, IDENTITY, b->aspect);
+        }
+        return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
     VkComponentMapping sw = IDENTITY;
@@ -960,6 +1006,11 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (b->samples > 1) return vk_dummy_view(want_textype);  // multisampled images can't be sampled as 2D
     if (want == have) {
         if (have == VK_IMAGE_VIEW_TYPE_CUBE) nly = 6;
+        if (have == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {  // (whole cubes only)
+            ly0 -= ly0 % 6;
+            nly = nly < 6 ? 6 : nly - nly % 6;
+            if (ly0 + nly > b->layers) ly0 = 0, nly = b->layers - b->layers % 6;
+        }
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, nly, sw, aspect);
     }
     if (want == VK_IMAGE_VIEW_TYPE_2D && (have == VK_IMAGE_VIEW_TYPE_2D_ARRAY || have == VK_IMAGE_VIEW_TYPE_CUBE))
