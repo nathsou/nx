@@ -45,7 +45,7 @@ static int import_heap_room(const ImportHeap *h, uint32_t n, uint64_t *room) {
 // Under this much room one import should fit but might not (a driver's own limits, other programs): the import is
 // tried once at the start (exec.c whole_import_probe_oom), with buffer device addresses enabled so lazy chunks can take
 // over. Machines with more (an RTX with 16 GB or more of RAM) skip the probe and keep the device as before.
-#define IMPORT_PROBE_BELOW (2 * HEAP_MAX)
+#define IMPORT_PROBE_BELOW (2 * GPU_SPAN)
 
 // Whether one import of the whole heap fits its system memory heap (import_heap_room), from the physical device;
 // *probe: it fits, but not by much (IMPORT_PROBE_BELOW), or LARECOMP_VK_SIM_HEAP_OOM=1 (the probe then fails).
@@ -66,19 +66,19 @@ static bool whole_import_fits(bool budget_ext, bool *probe) {
     uint64_t room = 0;
     int heap = import_heap_room(h, mp->memoryHeapCount, &room);
     const char *sim = getenv("LARECOMP_VK_SIM_HEAP_OOM");
-    if (heap < 0 || room >= HEAP_MAX + IMPORT_MARGIN) {
+    if (heap < 0 || room >= GPU_SPAN + IMPORT_MARGIN) {
         *probe = (heap >= 0 && room < IMPORT_PROBE_BELOW) || (sim && atoi(sim));
         return true;
     }
     LOG("[vk] guest heap: memory heap %d holds %llu MB (size %llu, budget %llu), one import needs %llu MB: "
         "imported in chunks as the game binds them\n", heap, (unsigned long long)(room >> 20),
         (unsigned long long)(h[heap].size >> 20), (unsigned long long)(h[heap].budget >> 20),
-        (unsigned long long)((HEAP_MAX + IMPORT_MARGIN) >> 20));
+        (unsigned long long)((GPU_SPAN + IMPORT_MARGIN) >> 20));
     return false;
 }
 
 // Whether the guest heap will be imported chunk by chunk (exec.c gmem_lazy): on a GPU whose storage buffers can't
-// span the heap (maxStorageBufferRange < HEAP_MAX: Intel, 1 GB); where the system memory heap or its budget can't hold
+// span the heap (maxStorageBufferRange < GPU_SPAN: Intel, 1 GB); where the system memory heap or its budget can't hold
 // one import of the whole heap (whole_import_fits: 8 GB laptops, issue #205); and on RADV when the dma-buf heap
 // (exec.c guest_heap_dmabuf) has no cached host-visible memory type that holds it - the same test, which needs only
 // the physical device - or LARECOMP_VK_GMEM_LAZY=1 (=0: never; a GPU with a short range then gets windows of one
@@ -92,7 +92,7 @@ static bool lazy_heap_predicted(bool budget_ext, bool *probe) {
     if (e) return atoi(e) != 0;
     if (getenv("LARECOMP_VK_NO_GMEM")) return false;
     uint64_t lim = g_vk.props.limits.maxStorageBufferRange;
-    if (lim && lim < HEAP_MAX) return true;  // (UHD 770 main pass: lazy 8.4 ms, 512 MB windows 8.5)
+    if (lim && lim < GPU_SPAN) return true;  // (UHD 770 main pass: lazy 8.4 ms, 512 MB windows 8.5)
 #ifdef _WIN32
     // The Windows AMD integrated driver accepts one import of the whole heap (the probe writes both ends) and then
     // faults a shader read of it: device lost, as soon as a save loads. Chunks stay inside the pages it maps.
@@ -109,7 +109,7 @@ static bool lazy_heap_predicted(bool budget_ext, bool *probe) {
         vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-            if ((mp.memoryTypes[i].propertyFlags & want) == want && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size >= HEAP_MAX) return false;
+            if ((mp.memoryTypes[i].propertyFlags & want) == want && mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size >= GPU_SPAN) return false;
     }
 #endif
     return true;
@@ -921,6 +921,9 @@ uint64_t renderer_present_count(void) { return total_frames; }  // (the game thr
 // render thread, total_frames.
 uint64_t renderer_exec_frame(void) { return rq_current_item() ? rq_frame() : total_frames; }
 uint64_t vk_frame_counter(void) { return renderer_exec_frame(); }  // (the translation's: g_frame_counter == total_frames)
+// (the menu's frame rate, runtime/ui/menu.mm: no frame generation here, so every game frame is one window image)
+void renderer_frame_counts(uint64_t *game, uint64_t *shown) { *game = *shown = total_frames; }
+void renderer_request_cover(void) {}  // (Metal's game selection screen covers: no selection screen here)
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
 static NvnTexture *g_last_presented;

@@ -1464,9 +1464,13 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
     o += oh[8];
     oh[1] = 0xB0;  // behavior / error info
     o += 0xB0;
-    oh[10] = 0x10;  // render info: elapsed frame count
-    if (o + 0x10 <= out->size) *(uint64_t *)(op + o) = elapsed;
-    o += 0x10;
+    if ((r->revision >> 24) - '0' >= 5) {  // render info, the elapsed frame count: REV5 and later (Ryujinx's
+        // IsElapsedFrameCountSupported). An older SDK checks the output's layout: Mario Tennis Aces (REV4) aborted in
+        // nn::audio::RequestUpdateAudioRenderer on the extra section.
+        oh[10] = 0x10;
+        if (o + 0x10 <= out->size) *(uint64_t *)(op + o) = elapsed;
+        o += 0x10;
+    }
     oh[15] = o;
     (void)resp;
 }
@@ -1560,8 +1564,9 @@ SERVICE("audren:u", audren_u) {
         r->event = kernel_create_event_pair(&r->event_w, &r->event_r);
         pthread_create(&r->thread, NULL, renderer_tick, r);
         audio_track(r, NULL);
-        LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters (%u destinations), %u effects\n",
-            r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters, r->split_dests, r->effects);
+        LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters (%u destinations), %u effects, "
+            "revision %.4s\n", r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters, r->split_dests,
+            r->effects, (const char *)&r->revision);
         ipc_return_object(resp, service_new("IAudioRenderer", audio_renderer, r));
         break;
     }

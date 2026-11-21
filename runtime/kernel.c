@@ -836,6 +836,12 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc);
 static _Atomic uint64_t svc_wait_ns[32][0x80], svc_calls[32][0x80];
 static int prof_svc = -1;
 
+static void ipc_release_core(void) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("LARECOMP_IPC_KEEP_CORE") && atoi(getenv("LARECOMP_IPC_KEEP_CORE"));
+    if (!keep) kernel_block_begin();
+}
+
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
@@ -1072,8 +1078,14 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         x[1] = h;
         break;
     }
-    case 0x21: x[0] = ipc_handle_request(c, (uint32_t)x[0]); break;  // SendSyncRequest
+    // An IPC request blocks its thread on the Switch until the service (another process) replies: the core goes to
+    // the next thread of its queue meanwhile, as in a kernel wait (taken back at the SVC's exit). Holding it through a
+    // slow request (a romfs read, a save commit) starved the core's other threads: ACNH's main thread waited on core 0
+    // behind a file-reading thread while a worker on core 1 ran a job against a manager it hadn't initialised yet (a
+    // null pointer at boot, 3 boots in 5 on a Linux machine under load). LARECOMP_IPC_KEEP_CORE=1: held, as before.
+    case 0x21: ipc_release_core(); x[0] = ipc_handle_request(c, (uint32_t)x[0]); break;  // SendSyncRequest
     case 0x22: {  // SendSyncRequestWithUserBuffer(buf, size, handle)
+        ipc_release_core();
         uint64_t saved = c->tpidrro;
         c->tpidrro = x[0];
         x[0] = ipc_handle_request(c, (uint32_t)x[2]);

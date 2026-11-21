@@ -110,18 +110,23 @@ GAMELIB  := $(GB)/game.dylib
 GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup  # (the runtime functions it calls: the app's own)
 else ifeq ($(PLATFORM),linux)
 EXE      := $(B)/nx
-DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
+DEPINC   := $(if $(DEPS),-I$(DEPS)/include) -isystem third_party/vma  # (Vulkan Memory Allocator: a system copy wins, vma.cpp)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
 endif
 GENFLAGS += $(GENARCH) -fPIC
+# LLVM's LICM spends most of an -O1 build of the few very large guest functions in its scalar promotion (a 13,900-line
+# function of Mario Tennis Aces: over 45 minutes, 218 s without it; Metroid Dread's largest: 335 s, 91 s). It promotes
+# next to nothing in lifted code (guest stores may alias the Cpu struct: -fno-strict-aliasing), so it is off. Not part of
+# GAMELIB_ID (the code is compatible either way): GENOPT=  builds with it again.
+GENOPT   ?= -mllvm -disable-licm-promotion
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
 # shaderc as the system's pkg-config file names it (Arch / Fedora / AOSC ship only libshaderc_shared, issue #22);
 # without one -lshaderc (Debian / Ubuntu's libshaderc.so). SHADERC=... overrides it.
 SHADERC  ?= $(shell pkg-config --libs shaderc 2>/dev/null || echo -lshaderc)
 # -rdynamic: crash backtraces name host functions (runtime/platform/linux.c)
 LDFLAGS  := -fuse-ld=lld -rdynamic $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lzstd \
-            -lvulkan $(SHADERC) -lpthread -ldl -lm
+            -lvulkan $(SHADERC) -lcurl -lpthread -ldl -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
@@ -172,7 +177,7 @@ all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
 $(GB)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
 	@mkdir -p $(dir $@)
-	@$(CC) $(GENFLAGS) -c $< -o $@
+	@$(CC) $(GENFLAGS) $(GENOPT) -c $< -o $@
 
 # (the id in a file that changes only when the id does: make doesn't see a changed -D value)
 $(B)/gamelib_id.stamp: FORCE
@@ -283,10 +288,18 @@ build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime
 
 # Every shader the game ships (romfs/system/shd), translated and compiled with Metal: no game needed to run
 # (tools/shader_corpus.m). `make corpus` (MSL + Metal) - add CORPUS_ARGS=--glsl for the Vulkan GLSL translation.
+ifeq ($(PLATFORM),macos)
 build/shader_corpus: tools/shader_corpus.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/yaz0.h
 	@mkdir -p $(dir $@)
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -Iruntime/nvn/maxwell -Iruntime/nvn -I/opt/homebrew/opt/zstd/include \
 	    tools/shader_corpus.m runtime/nvn/maxwell/translate.c -o $@ -L/opt/homebrew/opt/zstd/lib -lzstd
+else
+# (Linux / Windows: the Vulkan backend's GLSL, compiled to SPIR-V with shaderc: tools/shader_corpus_vk.c)
+build/shader_corpus: tools/shader_corpus_vk.c runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/yaz0.h
+	@mkdir -p $(dir $@)
+	$(CC) -O1 -Iruntime/nvn/maxwell -Iruntime/nvn $(DEPINC) tools/shader_corpus_vk.c runtime/nvn/maxwell/translate.c -o $@ \
+	    $(if $(DEPS),-L$(DEPS)/lib) -lzstd $(SHADERC) -lm
+endif
 # Then the game's prepared pipelines into its Metal binary archive (cache/<game>/shaders.metalarchive: nx in
 # preparation-only mode, games/<id>/shader_variants.txt and the shaders found in the game files), which the game loads.
 # (the archive is built even when the check finds shaders it can't translate - ACNH's agl debug shaders - and corpus

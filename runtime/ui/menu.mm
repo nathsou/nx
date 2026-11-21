@@ -8,6 +8,9 @@
 // scrolls, a drag sideways moves a slider; sized in points for fingers, inside the screen's safe area. The button shows
 // while the screen is touched (and a few seconds after). With several games in the app, a selection screen comes
 // first (menu_pick_game) and the Game tab can go back to it.
+// Linux / Windows (MENU_VK): the same menu, drawn by Dear ImGui's Vulkan backend into the window image
+// (runtime/nvn/vulkan/device.c calls menu_render inside its overlay); no selection or loading screen, no covers, no
+// frame generation (Metal's), FSR 1 as the sharp upscaler.
 #include "menu.h"
 
 #if defined(__APPLE__)
@@ -20,9 +23,17 @@
 #define MENU_TOUCH 0
 #endif
 #define HAVE_METALFX (!TARGET_OS_SIMULATOR)  // (the iOS Simulator has no MetalFX: renderer bilinear / optical flow)
+#define MENU_VK 0
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <ImageIO/ImageIO.h>
+static double menu_now(void) { return CACurrentMediaTime(); }
+#else
+#define MENU_TOUCH 0
+#define HAVE_METALFX 0
+#define MENU_VK 1
+#endif
+#if !defined(__APPLE__) || defined(__OBJC__)  // (the whole menu: Apple's and the Vulkan platforms')
 #include <pthread.h>
 #include <SDL3/SDL.h>
 
@@ -41,7 +52,18 @@
 #include <vector>
 
 #include "imgui.h"
+#if MENU_VK
+#include "backends/imgui_impl_vulkan.h"
+#include <vulkan/vulkan.h>
+extern "C" bool vk_imgui_backend_init(void);       // runtime/nvn/vulkan/imgui_glue.cpp
+extern "C" void vk_imgui_backend_shutdown(void);
+extern "C" void *vk_overlay_begin(void *window_cmd);  // runtime/nvn/vulkan/device.c
+extern "C" void vk_overlay_end(void *window_cmd, void *cmd);
+extern "C" bool plat_exe_path(char *buf, size_t size);
+static double menu_now(void) { return (double)SDL_GetTicksNS() / 1e9; }
+#else
 #include "backends/imgui_impl_metal.h"
+#endif
 
 extern "C" {
 #include "../settings.h"
@@ -90,7 +112,7 @@ static std::atomic<int> g_fingers{0};
 static std::atomic<double> g_last_touch{-100};
 static double button_visibility(void) {  // 1 shown, 0 hidden, between: fading out
     if (g_fingers > 0) return 1;
-    double t = CACurrentMediaTime() - g_last_touch;
+    double t = menu_now() - g_last_touch;
     return t < BUTTON_SHOW ? 1 : t > BUTTON_SHOW + BUTTON_FADE ? 0 : 1 - (t - BUTTON_SHOW) / BUTTON_FADE;
 }
 extern "C" int g_game_count;  // runtime/main.c: games in the app's Documents
@@ -234,7 +256,7 @@ extern "C" bool menu_handle_event(const SDL_Event *e) {
         bool shown = button_visibility() > 0.5;  // (before this touch: a touch on a hidden button only shows it)
         if (e->type == SDL_EVENT_FINGER_DOWN) g_fingers++;
         if ((e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) && g_fingers > 0) g_fingers--;
-        g_last_touch = CACurrentMediaTime();
+        g_last_touch = menu_now();
         if (!open) {  // (the game takes no touches: only the menu button's, and Minus / Plus beside it)
             float pad = g_font_px * 0.5f, w = g_button[2] - g_button[0], step = w + g_button_gap;
             if (e->type != SDL_EVENT_FINGER_DOWN || y < g_button[1] - pad || y > g_button[3] + pad) return true;
@@ -459,7 +481,9 @@ __attribute__((used, section("__DATA,__rt_reset"))) static const ResetFn menu_re
 static bool g_inited;
 static float g_scale;  // the UI's size: the window's height over 900 points' worth (iOS: points, for fingers)
 static ImFont *g_bold, *g_title, *g_small;
+#if !MENU_VK
 static id<MTLDevice> g_dev;
+#endif
 static const ImVec4 C_ACCENT(0.40f, 0.84f, 0.64f, 1), C_PANEL(0.075f, 0.082f, 0.100f, 0.985f), C_SIDE(0.055f, 0.060f, 0.074f, 1);
 static const ImVec4 C_CARD(0.115f, 0.125f, 0.150f, 1), C_TEXT(0.93f, 0.95f, 0.97f, 1), C_MUTED(0.60f, 0.64f, 0.69f, 1);
 static const ImVec4 C_CONTROL(0.20f, 0.215f, 0.25f, 1), C_ON_ACCENT(0.04f, 0.10f, 0.07f, 1);
@@ -512,10 +536,24 @@ static const char *font_path(const char *file) {
     char *out = p[k++ & 3];
     snprintf(out, 1024, "third_party/fonts/DejaVu/%s", file);
     if (access(out, R_OK) == 0) return out;
+#if MENU_VK  // (started from elsewhere: next to the executable, build/nx -> third_party/, or a release folder's fonts/)
+    char exe[900];
+    if (plat_exe_path(exe, sizeof exe)) {
+        char *sl = strrchr(exe, '/');
+        if (sl) *sl = 0;
+        const char *rel[] = {"../third_party/fonts/DejaVu", "../../third_party/fonts/DejaVu", "fonts"};
+        for (const char *r : rel) {
+            snprintf(out, 1024, "%s/%s/%s", exe, r, file);
+            if (access(out, R_OK) == 0) return out;
+        }
+    }
+    return NULL;
+#else
     NSString *r = [[NSBundle mainBundle] pathForResource:@(file) ofType:nil];  // (the app: Contents/Resources, iOS: its root)
     if (!r) return NULL;
     snprintf(out, 1024, "%s", r.UTF8String);
     return out;
+#endif
 }
 static void setup_fonts(float scale) {
     ImGuiIO &io = ImGui::GetIO();
@@ -746,6 +784,16 @@ static void page_game(void) {
 static std::mutex g_paste_mx;  // (main thread -> render thread: the clipboard's text, read where UIKit / AppKit want it)
 static std::string g_pasted;
 static std::atomic<bool> g_paste_ready{false};
+#if MENU_VK
+static void paste_main(void *) {  // (SDL's clipboard: the main thread's)
+    char *t = SDL_GetClipboardText();
+    std::lock_guard<std::mutex> l(g_paste_mx);
+    g_pasted = t ? t : "";
+    SDL_free(t);
+    g_paste_ready = true;
+}
+static void paste_request(void) { SDL_RunOnMainThread(paste_main, NULL, false); }
+#else
 static void paste_request(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
 #if MENU_TOUCH
@@ -758,6 +806,7 @@ static void paste_request(void) {
         g_paste_ready = true;
     });
 }
+#endif
 static void cloud_card(void) {
     static char conn[512];
     static std::string conn_error, pick;
@@ -898,6 +947,12 @@ static void page_saves(void) {
                                              [path stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet]]];
             [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
         });
+    }
+#elif MENU_VK
+    if (button("Open the saves folder")) {
+        std::error_code ec;
+        std::string url = "file://" + fs::absolute(root, ec).string();
+        if (!SDL_OpenURL(url.c_str())) fprintf(stderr, "[menu] opening %s: %s\n", url.c_str(), SDL_GetError());
     }
 #else
     if (button("Open the saves folder")) {
@@ -1072,11 +1127,11 @@ static void page_video(void) {
         if (combo("##res", &g_settings.res_mode, n, v, 9, w)) g_settings.res_auto = false, changed = true;
         row_end();
     }
-    if (HAVE_METALFX) {
-        static const char *const n[] = {"Bilinear", "MetalFX"};
-        static const int v[] = {UPSCALE_BILINEAR, UPSCALE_METALFX};
+    if (HAVE_METALFX || MENU_VK) {
+        static const char *const n[] = {"Bilinear", MENU_VK ? "FSR 1" : "MetalFX"};
+        static const int v[] = {UPSCALE_BILINEAR, MENU_VK ? UPSCALE_FSR1 : UPSCALE_METALFX};
         float w = seg_w(n, 2);
-        row_begin("Upscaler", NULL, w);
+        row_begin("Upscaler", MENU_VK ? "How a lower resolution reaches the window." : NULL, w);
         if (segmented("##up", &g_settings.upscaler, n, v, 2, w)) g_settings.upscaler_auto = false, changed = true;
         row_end();
     }
@@ -1098,7 +1153,7 @@ static void page_video(void) {
         changed |= segmented("##cap", &g_settings.fps_cap, n, v, 4, w);
         row_end();
     }
-    {
+    if (!MENU_VK) {  // (Metal's: runtime/nvn/framegen.m)
         static const char *const n[] = {"Off", "60", "120"};
         static const int v[] = {0, 60, 120};
         float w = seg_w(n, 3);
@@ -1311,6 +1366,13 @@ static void draw_menu(void) {
     ImGui::End();
 }
 
+#if MENU_VK  // (no selection or loading screen: one game per run)
+static void draw_picker(void) {}
+static void draw_loading(void) {}
+extern "C" void menu_loading_status(const char *status) { (void)status; }
+extern "C" void menu_loading_begin(const char *title, const char *cover) { (void)title, (void)cover; }
+extern "C" void menu_loading_end(void) {}
+#else
 // ---- covers (the selection and loading screens): cache/<game>/cover.jpg, a game frame (runtime/nvn/metal.m)
 static NSMutableDictionary<NSString *, id> *g_covers;  // path -> texture, or NSNull (none)
 static id<MTLTexture> cover_texture(const char *path) {
@@ -1430,7 +1492,7 @@ static void draw_loading(void) {
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     ImVec2 a = vp->Pos, b(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
     dl->AddRectFilled(a, b, IM_COL32(6, 7, 9, 255));
-    double t = CACurrentMediaTime() - g_loading_t0;
+    double t = menu_now() - g_loading_t0;
     float in = (float)fmin(t / 0.6, 1);  // (a fade in)
     draw_cover(dl, a, b, g_loading_cover, g_loading_title, 0, 0, 1 - 0.38f * in, false);
     dl->AddRectFilledMultiColor(ImVec2(a.x, a.y + vp->Size.y * 0.45f), b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
@@ -1485,7 +1547,7 @@ extern "C" void menu_loading_begin(const char *title, const char *cover) {
     int pw, ph;  // (the main thread's: the layer's size before the game's loop sets it)
     SDL_GetWindowSizeInPixels(ui_window(), &pw, &ph);
     ((__bridge CAMetalLayer *)ui_metal_layer()).drawableSize = CGSizeMake(pw, ph);
-    g_loading_t0 = CACurrentMediaTime();
+    g_loading_t0 = menu_now();
     g_loading_stop = false;
     g_loading = true;
     if (pthread_create(&g_loading_thread, NULL, loading_main, NULL)) g_loading = false;
@@ -1493,11 +1555,11 @@ extern "C" void menu_loading_begin(const char *title, const char *cover) {
 extern "C" void menu_loading_end(void) {
     if (!g_loading) return;
     if (const char *e = getenv("LARECOMP_LOADING_HOLD"))  // (tests) the loading screen stays at least that many seconds
-        while (CACurrentMediaTime() - g_loading_t0 < atof(e)) usleep(20000);
+        while (menu_now() - g_loading_t0 < atof(e)) usleep(20000);
     g_loading_stop = true;
     pthread_join(g_loading_thread, NULL);
     g_loading = false;
-    fprintf(stderr, "[menu] loading screen: %.1f s\n", CACurrentMediaTime() - g_loading_t0);
+    fprintf(stderr, "[menu] loading screen: %.1f s\n", menu_now() - g_loading_t0);
 }
 
 // (main thread, before a game boots: no game draws) the selection screen until a game is picked; its index
@@ -1548,6 +1610,7 @@ extern "C" int menu_pick_game(int n, const char *const titles[], const char *con
     }
     return g_picked;
 }
+#endif  // !MENU_VK
 
 #if MENU_TOUCH
 // The menu button, at the top of the screen in the middle (clear of a game's corners), faint over the game
@@ -1575,20 +1638,84 @@ static void draw_menu_button(float width) {
 }
 #endif
 
-extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+#if MENU_VK
+extern "C" void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     {   // (tests) LARECOMP_MENU_TEST_TIME=<seconds>: the clock moved that far while open; LARECOMP_MENU_CLOSE_MS=<ms>: closed
         // that long after it opened (a paused game takes no scripted input)
         static double opened;
         static int done;
         if (g_open && !opened) {
-            opened = CACurrentMediaTime();
+            opened = menu_now();
             if (getenv("LARECOMP_MENU_TEST_TIME") && !done++) {
                 g_settings.time_offset += atoll(getenv("LARECOMP_MENU_TEST_TIME"));
                 time_offset_changed();
             }
         }
         if (!g_open) opened = 0;
-        if (g_open && getenv("LARECOMP_MENU_CLOSE_MS") && (CACurrentMediaTime() - opened) * 1000 > atof(getenv("LARECOMP_MENU_CLOSE_MS")))
+        if (g_open && getenv("LARECOMP_MENU_CLOSE_MS") && (menu_now() - opened) * 1000 > atof(getenv("LARECOMP_MENU_CLOSE_MS")))
+            set_open(false);
+    }
+    bool open = g_open, fps = g_settings.show_fps, loading = g_loading;
+    if (!open && !fps && !MENU_TOUCH && !g_picking && !loading) return;
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    ensure_context();
+    ImGuiIO &io = ImGui::GetIO();
+    float scale = fmaxf(1.0f, roundf(target_h / 900.0f * 4) / 4);
+#if MENU_TOUCH  // (in points: a phone's 15, an iPad's 18 - the same size whatever the screen's pixels)
+    float points = target_h / fmaxf(g_density, 1);
+    scale = roundf(g_density * (points < 600 ? 0.9f : 1.05f) * 4) / 4;
+#endif
+    if (!g_inited || scale != g_scale) {
+        if (g_inited) vk_imgui_backend_shutdown();  // (the font atlas at the new size: uploaded by the next init)
+        setup_fonts(scale);
+        setup_style(scale);
+        if (!vk_imgui_backend_init()) return;
+        g_inited = true;
+        g_scale = scale;
+#if MENU_TOUCH
+        g_font_px = 17.0f * scale;
+#endif
+    }
+    static double last;
+    double now = menu_now();
+    io.DeltaTime = last > 0 && now > last ? (float)fmin(now - last, 0.1) : 1 / 60.0f;
+    last = now;
+    io.DisplaySize = ImVec2((float)target_w, (float)target_h);
+    io.DisplayFramebufferScale = ImVec2(1, 1);
+    ImGui_ImplVulkan_NewFrame();
+    ImGui::NewFrame();
+    g_popup = false;
+    if (loading) draw_loading();
+    else if (g_picking) draw_picker();
+    else if (open) draw_menu();
+    if (fps && !g_picking && !loading) draw_fps();
+#if MENU_TOUCH
+    if (!open && !g_picking && !loading) draw_menu_button(target_w);
+#endif
+    g_text_input = io.WantTextInput;
+    ImGui::Render();
+    ImDrawData *dd = ImGui::GetDrawData();
+    if (!dd || dd->CmdListsCount == 0) return;
+    void *ov = vk_overlay_begin(cmd);  // (a secondary command buffer the recorder executes in its place, or cmd itself)
+    ImGui_ImplVulkan_RenderDrawData(dd, (VkCommandBuffer)ov);
+    vk_overlay_end(cmd, ov);
+}
+
+#else
+extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+    {   // (tests) LARECOMP_MENU_TEST_TIME=<seconds>: the clock moved that far while open; LARECOMP_MENU_CLOSE_MS=<ms>: closed
+        // that long after it opened (a paused game takes no scripted input)
+        static double opened;
+        static int done;
+        if (g_open && !opened) {
+            opened = menu_now();
+            if (getenv("LARECOMP_MENU_TEST_TIME") && !done++) {
+                g_settings.time_offset += atoll(getenv("LARECOMP_MENU_TEST_TIME"));
+                time_offset_changed();
+            }
+        }
+        if (!g_open) opened = 0;
+        if (g_open && getenv("LARECOMP_MENU_CLOSE_MS") && (menu_now() - opened) * 1000 > atof(getenv("LARECOMP_MENU_CLOSE_MS")))
             set_open(false);
     }
     bool open = g_open, fps = g_settings.show_fps, loading = g_loading;
@@ -1615,7 +1742,7 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
 #endif
     }
     static double last;
-    double now = CACurrentMediaTime();
+    double now = menu_now();
     io.DeltaTime = last > 0 && now > last ? (float)fmin(now - last, 0.1) : 1 / 60.0f;
     last = now;
     io.DisplaySize = ImVec2((float)target.width, (float)target.height);
@@ -1641,46 +1768,6 @@ extern "C" void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTe
     [enc endEncoding];
 }
 
-#else  // (Windows / Linux: no menu yet - F11 toggles fullscreen)
-#include <SDL3/SDL.h>
-#include <atomic>
-#include <string.h>
-
-extern "C" {
-#include "../settings.h"
-}
-
-#define DREADRECOMP_VERSION "0.0.1-dev"
-static std::atomic<bool> g_want_fullscreen_apply{true};
-extern "C" {
-const char *larecomp_version(void) { return DREADRECOMP_VERSION; }
-bool menu_is_open(void) { return false; }
-void menu_loading_begin(const char *title, const char *cover) { (void)title, (void)cover; }
-void menu_loading_status(const char *status) { (void)status; }
-void menu_loading_end(void) {}
-bool menu_input_captured(void) { return false; }
-bool menu_pauses_game(void) { return false; }
-void menu_test_open(void) {}
-int menu_keyboard_run(const char *initial, int max_len, char *out, int cap) {
-    (void)max_len;
-    snprintf(out, cap, "%s", initial ? initial : "");
-    return 1;
-}
-bool menu_handle_event(const SDL_Event *e) {
-    if (e->type == SDL_EVENT_KEY_DOWN && e->key.key == SDLK_F11 && !e->key.repeat) {
-        g_settings.fullscreen = !g_settings.fullscreen;
-        g_want_fullscreen_apply = true;
-        return true;
-    }
-    return false;
-}
-extern uint32_t g_window_resize_request;
-void menu_apply_window_requests(void *win) {
-    SDL_Window *w = (SDL_Window *)win;
-    if (g_want_fullscreen_apply.exchange(false)) SDL_SetWindowFullscreen(w, g_settings.fullscreen);
-    if (uint32_t r = __atomic_exchange_n(&g_window_resize_request, 0u, __ATOMIC_RELAXED))
-        SDL_SetWindowSize(w, (int)(r >> 16), (int)(r & 0xffff));
-}
-void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) { (void)cmd, (void)target_w, (void)target_h; }
-}
 #endif
+#endif  // (the whole menu)
+

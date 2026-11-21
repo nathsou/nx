@@ -831,10 +831,15 @@ static void *worker(void *a) {
     return NULL;
 }
 
+// Draws whose output a later frame can't redo: the game renders some textures once (ACNH's colour grading 3D LUT,
+// eight slices drawn at boot; its sky panorama, which the sea reflects: black water), so skipping such a draw while its
+// shaders compile would lose it for good. Draws into 3D textures, and into targets not drawn the frame before
+// (textures.c renderer_texture_drawn_lately), compile on the spot (renderer.m's rule).
+static bool g_draw_must_run;  // (render thread)
 static bool sync_shaders(void) {
     static int v = -1;
     if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
-    return v;
+    return v || g_draw_must_run;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -930,6 +935,7 @@ static struct {
     bool prim_restart;
     uint32_t restart_index;
     uint64_t copy_row_stride, copy_image_stride;
+    bool render_off;  // (SetRenderEnable / SetRenderEnableConditional) draws and clears are skipped
 } st;
 
 uint32_t nvn_window_origin(void);
@@ -1384,6 +1390,27 @@ static void begin_pass(void) {
         gp_mark(cb, "pass: %d color %ux%u (drawn %.0fx%.0f) fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0,
                 t0 ? t0->height : 0, t0 ? t0->width * dsx : 0, t0 ? t0->height * dsy : 0, t0 ? t0->format : 0,
                 st.rt.depth ? "yes" : "no");
+    }
+    {   // attachments of one guest size, some scaled and some not: all scaled (textures.c renderer_texture_promote_scalable)
+        extern bool renderer_texture_promote_scalable(NvnTexture *t);
+        NvnTexture *at[9];
+        int n = 0;
+        bool scaled = false;
+        for (int i = -1; i < st.rt.ncolor && n < 9; i++) {
+            NvnTexture *t = i < 0 ? st.rt.depth : st.rt.color[i];
+            if (!t || !t->backend) continue;
+            float sx, sy;
+            renderer_texture_scale(t, &sx, &sy);
+            if (sx != 1 || sy != 1) scaled = true;
+            at[n++] = t;
+        }
+        for (int i = 0; scaled && i < n; i++)
+            for (int k = 0; k < n; k++)
+                if (k != i && at[k]->width == at[i]->width && at[k]->height == at[i]->height) {
+                    float sx, sy;
+                    renderer_texture_scale(at[k], &sx, &sy);
+                    if (sx != 1 || sy != 1) { renderer_texture_promote_scalable(at[i]); break; }
+                }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
@@ -1873,7 +1900,7 @@ static void compile_program(void *arg) {
 // Translates both stages (false: failed, logged). Holds the translator for the whole program.
 static bool translate_program_now(Prog *p) {
     maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_size = GPU_SPAN;
     maxwell_gmem_chunk_shift = gmem_chunk_shift();
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
@@ -2213,6 +2240,9 @@ typedef struct {
     uint32_t stride[17], divisor[17], used_streams;
     uint8_t blend[8][8];
     uint8_t blend_on, a2c, topo_class, poly_fill;
+    // BindProgram(null, fragment) with the vertex stage still bound (Dread's depth prepass): no fragment shader, no
+    // colour writes (renderer.m's depth-only pipelines). The program's own fragment shader would run its discards.
+    uint8_t depth_only;
     uint32_t write_mask[8];
 } PipeKey;
 
@@ -2235,7 +2265,7 @@ struct PipeMemo {
     int nattrib, nstream;
     VkFormat color[8], depth, stencil;
     uint32_t attrib[16], stream[16][2], rt_fmt[8];
-    uint8_t blend[8][8], blend_on, a2c, cls, poly_fill;
+    uint8_t blend[8][8], blend_on, a2c, cls, poly_fill, depth_only;
     Pipe *pp;
     VtxLayout vl;  // the layout pipe_key_fill made from these inputs (dynamic vertex input leaves it out of pp's key)
 };
@@ -2397,6 +2427,8 @@ static void pipe_ci_fill(PipeCI *c, const PipeKey *k) {
     }
     c->cb = (VkPipelineColorBlendStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                                   .attachmentCount = k->ncolor, .pAttachments = c->cba};
+    if (k->depth_only)
+        for (uint32_t i = 0; i < k->ncolor; i++) c->cba[i] = (VkPipelineColorBlendAttachmentState){0};
     memcpy(c->dyn, DYN, sizeof DYN);
     if (g_vk.vids) c->dyn[NDYN] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
     c->dy = (VkPipelineDynamicStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -2404,7 +2436,8 @@ static void pipe_ci_fill(PipeCI *c, const PipeKey *k) {
     c->ri = (VkPipelineRenderingCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor,
                                             .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth,
                                             .stencilAttachmentFormat = k->stencil};
-    c->pi = (VkGraphicsPipelineCreateInfo){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &c->ri, .stageCount = 2,
+    c->pi = (VkGraphicsPipelineCreateInfo){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &c->ri,
+                                           .stageCount = k->depth_only ? 1 : 2,
                                            .pStages = c->stages, .pVertexInputState = g_vk.vids ? NULL : &c->vi,
                                            .pInputAssemblyState = &c->ia, .pViewportState = &c->vs, .pRasterizationState = &c->rs,
                                            .pMultisampleState = &c->ms, .pDepthStencilState = &c->ds, .pColorBlendState = &c->cb,
@@ -3189,7 +3222,7 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
 static void bind_note(int kind, uint64_t addr, uint64_t size) {
     static int on = -1;
     if (on < 0) on = getenv("LARECOMP_LOG_BINDS") != NULL;
-    if (!on || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX || size < 8) return;
+    if (!on || addr < HEAP_BASE || addr - HEAP_BASE + size > GPU_SPAN || size < 8) return;
     extern int nvn_pool_flags_at(uint64_t addr);
     enum { REC = 8192 };
     static struct { uint64_t addr, size, hash; uint8_t kind; } rec[REC];
@@ -3318,6 +3351,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
+    if (r.addr && (r.addr < GUEST_LO || r.addr + 16 > GUEST_HI)) r.addr = 0;  // (outside guest memory: unbound, as Metal)
     if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
@@ -3379,14 +3413,14 @@ static bool host_import(uint64_t off, uint64_t size, VkBuffer *out_buf, VkDevice
 }
 
 // One import of the whole heap, tried once at the start where it should fit but not by much (device.c
-// whole_import_fits: g_vk.heap_probe): HEAP_MAX of scratch host memory imported and used by one submission, then
+// whole_import_fits: g_vk.heap_probe): GPU_SPAN of scratch host memory imported and used by one submission, then
 // freed. True: it ran out of memory (the import or the submission: issue #205's driver took the import and failed
 // the first submission), and the heap is imported in lazy chunks instead - decided here, at device creation (vk_exec_init),
-// before any shader is translated or the game starts. Costs: the import pins HEAP_MAX of RAM for a moment (well under a
+// before any shader is translated or the game starts. Costs: the import pins GPU_SPAN of RAM for a moment (well under a
 // second). Any other failure: logged, and the heap is imported as one buffer as before.
 // LARECOMP_VK_SIM_HEAP_OOM=1: the probe runs, then reports out of memory (tests the fallback on any GPU).
 static bool whole_import_probe_oom(void) {
-    const uint64_t size = HEAP_MAX, align = 64 << 10;  // (minImportedHostPointerAlignment: 4 KB here, 64 KB at most)
+    const uint64_t size = GPU_SPAN, align = 64 << 10;  // (minImportedHostPointerAlignment: 4 KB here, 64 KB at most)
     const char *sim = getenv("LARECOMP_VK_SIM_HEAP_OOM");
     rec_drain();  // (the queue below is the recorder's: idle and empty while this runs)
     uint64_t t0 = plat_now_ns();
@@ -3465,7 +3499,7 @@ static bool gmem_import(uint64_t size) {
 // #40, #51). Here the heap is instead allocated by the driver (cached system memory, exported as a dma-buf) and that
 // memory is mapped at HEAP_BASE before the game starts, so the GPU sees an ordinary buffer. Called from boot (main.c)
 // on the main thread before any guest thread exists; a reboot frees it with gmem_buf (vk_exec_reset) and the guest
-// window's reset unmaps it, so the next boot gets fresh zeroed memory. Costs: the whole HEAP_MAX is committed once the
+// window's reset unmaps it, so the next boot gets fresh zeroed memory. Costs: the whole GPU_SPAN is committed once the
 // GPU first uses it, and Linux write tracking can't watch this mapping (the heap is then re-checked like on Beta 4).
 // Nothing writes the heap before boot (the start screen doesn't use guest memory): the mapping replaces it unseen.
 // The mapping: where the driver has VK_EXT_map_memory_placed (RADV, Mesa 24.1+), it maps the memory at HEAP_BASE
@@ -3478,7 +3512,7 @@ static bool gmem_import(uint64_t size) {
 static bool gmem_dmabuf;  // the heap is the driver's memory mapped at HEAP_BASE
 static bool gmem_placed;  // ... by the driver (vkMapMemory2KHR, placed): unmapped through it at a reboot
 
-// The driver maps `mem` (HEAP_MAX, one allocation) at HEAP_BASE. NULL, or why not; HEAP_BASE is ordinary guest
+// The driver maps `mem` (GPU_SPAN, one allocation) at HEAP_BASE. NULL, or why not; HEAP_BASE is ordinary guest
 // memory again after a failure.
 static const char *heap_map_placed(VkDeviceMemory mem) {
 #ifndef VK_EXT_map_memory_placed
@@ -3503,7 +3537,7 @@ static const char *heap_map_placed(VkDeviceMemory mem) {
     if (r == VK_SUCCESS && p == (void *)(uintptr_t)HEAP_BASE) return NULL;
     if (r == VK_SUCCESS) unmap2(g_vk.dev, &ui);
     // (the old mapping may be gone: plain zeroed memory again, registered for write tracking like a reboot's)
-    if (!plat_reset_guest(HEAP_BASE, HEAP_BASE + HEAP_MAX)) FATAL("cannot restore the guest heap mapping\n");
+    if (!plat_reset_guest(HEAP_BASE, HEAP_BASE + GPU_SPAN)) FATAL("cannot restore the guest heap mapping\n");
     return "the driver's placed mapping failed";
 #endif
 }
@@ -3527,7 +3561,7 @@ static bool guest_heap_dmabuf(void) {
     if (gmem_buf || !g_vk.dev || !(g_vk.dmabuf || g_vk.map_placed) || getenv("LARECOMP_VK_NO_GMEM")) return false;
     const char *e = getenv("LARECOMP_VK_HEAP_DMABUF");
     if (e ? !atoi(e) : !strstr(g_vk.props.deviceName, "RADV")) return false;
-    const uint64_t size = HEAP_MAX;
+    const uint64_t size = GPU_SPAN;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
     const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
@@ -3703,13 +3737,13 @@ static VkDescriptorBufferInfo gmem_info(void) {
 
 // ---- the guest heap for shaders in chunks (shader.h maxwell_gmem_chunk_shift)
 // Chunks for two reasons:
-// - a GPU whose storage buffers can't span HEAP_MAX (maxStorageBufferRange: 1 GB on Intel): binding one range past
+// - a GPU whose storage buffers can't span GPU_SPAN (maxStorageBufferRange: 1 GB on Intel): binding one range past
 //   that limit is out of spec, and the UHD 630's driver then read garbage beyond 1 GB: dark lighting, black objects
 //   (issue #8). Lazy chunks as below (device.c lazy_heap_predicted); where they aren't possible (or with
 //   LARECOMP_VK_GMEM_LAZY=0), windows of the one imported heap, one binding each;
 // - lazy import (gmem_lazy): on Linux/AMD the import is a userptr buffer and amdgpu checks every page of such a buffer
 //   again on each submission - 3.2 GB of heap, ~45 ms of driver time a frame (issues #40, #51). The dma-buf heap
-//   (guest_heap_dmabuf) avoids that, but needs a cached host-visible memory type that can hold HEAP_MAX, and APUs
+//   (guest_heap_dmabuf) avoids that, but needs a cached host-visible memory type that can hold GPU_SPAN, and APUs
 //   have none (Steam Deck: a 3072 MB system heap; Ryzen 3200G: 3172 MB, so the 3220 MB import is also over its GTT
 //   budget: issues #40, #92). The GPU itself reads only a little of the heap in place: 73 MB over a four-area tour
 //   (vertex and index data 67 MB, storage buffers 9 MB), 15-28 MB a frame, scattered over the whole 3.25 GB (measured
@@ -3734,7 +3768,7 @@ static struct {
     VkDeviceMemory mem;
     uint64_t size, addr;  // (addr: the chunk's device address, lazy mode)
 } gc[GC_MAX];
-static int gc_n;             // chunks over HEAP_MAX
+static int gc_n;             // chunks over GPU_SPAN
 static uint32_t gc_shift;    // 0: one buffer
 static bool gc_lazy;         // imports per chunk (else windows of gmem_buf)
 static VkBuffer gc_dummy, gc_miss_buf;
@@ -3815,7 +3849,7 @@ static void gmem_chunk_decide(void) {
     shift = 0;
     if (e) { uint64_t b = strtoull(e, NULL, 10) << 20; if (b) shift = 63 - __builtin_clzll(b); }
     else if (gc_lazy) shift = 24;
-    else if (HEAP_MAX > lim && lim) shift = 63 - __builtin_clzll(lim);
+    else if (GPU_SPAN > lim && lim) shift = 63 - __builtin_clzll(lim);
     if (shift > 30) shift = 30;  // (1 GB at most: NVIDIA computes a block's length in signed 32 bits, a 2 GB range reads as negative)
     // The table holds GC_MAX chunks at most, and a stage's storage buffers (the windows, gfast, binding 17) its limit
     // (Intel: 200): a chunk size that doesn't fit grows until it does (4 MB asked for -> 16 MB). One buffer only where
@@ -3827,16 +3861,16 @@ static void gmem_chunk_decide(void) {
         shift = 0;
     }
     while (shift) {
-        n = (int)((HEAP_MAX + (1ull << shift) - 1) >> shift);
+        n = (int)((GPU_SPAN + (1ull << shift) - 1) >> shift);
         bool fits = n <= GC_MAX && (gc_lazy || ((uint32_t)n + 8 <= per_stage && (uint32_t)n + 1 <= per_set));
         if (fits) break;
-        if ((1ull << shift) >= HEAP_MAX) { shift = 0; break; }  // (not even one chunk fits: one buffer)
+        if ((1ull << shift) >= GPU_SPAN) { shift = 0; break; }  // (not even one chunk fits: one buffer)
         shift++;
     }
     if (shift != asked && asked)
         LOG("[vk] guest heap chunks of %llu MB don't fit here (%d chunks at most, %u storage buffers a stage, %u a set): %s\n",
             (unsigned long long)(1ull << asked) >> 20, GC_MAX, per_stage, per_set, shift ? "larger chunks" : "one buffer");
-    if (!shift && HEAP_MAX > lim && lim) LOG("[vk] warning: one storage buffer over the heap exceeds this GPU's %llu MB range\n", (unsigned long long)lim >> 20);
+    if (!shift && GPU_SPAN > lim && lim) LOG("[vk] warning: one storage buffer over the heap exceeds this GPU's %llu MB range\n", (unsigned long long)lim >> 20);
     if (!shift) gc_lazy = false;
     gc_shift = (uint32_t)shift;
     gc_n = shift ? n : 0;
@@ -3853,7 +3887,7 @@ static uint64_t gmem_heap_size(void) {
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     uint64_t ring = snap_ring_end();  // (overlap: the storage copies' ring right after the heap is the GPU's too)
     if (ring > want) want = ring;
-    return want > HEAP_MAX ? HEAP_MAX : want;
+    return want > GPU_SPAN ? GPU_SPAN : want;
 }
 
 static bool host_import(uint64_t off, uint64_t size, VkBuffer *buf, VkDeviceMemory *mem, bool bda);
@@ -3947,7 +3981,7 @@ static bool gc_scan_needed(void) {
 // game's storage buffers are bound with sizes the shaders read past (the lighting pass's tile list: the misses sat
 // 1-9 MB into the chunk after the bound range), and a size of 0 means "the rest of the buffer".
 static void gc_touch(uint64_t off, uint64_t size) {
-    if (!gc_lazy || off >= HEAP_MAX) return;
+    if (!gc_lazy || off >= GPU_SPAN) return;
     int k0 = (int)(off >> gc_shift), k1 = (int)((off + (size ? size : 1) - 1) >> gc_shift) + 1;
     if (k1 >= gc_n) k1 = gc_n - 1;
     for (int k = k0; k <= k1; k++) if (!gc[k].buf) gc_import(k);
@@ -4087,7 +4121,7 @@ static void gmem_direct_pick(uint32_t stages, uint32_t gd[GMEM_DIRECT_MAX * 4], 
         if (!(stages & (1u << stage))) continue;
         for (int i = 0; i < 16 && n < GMEM_DIRECT_MAX; i++) {
             uint64_t a = sbufs(stage)[i].addr, sz = sbufs(stage)[i].size;  // (overlap: a snapshotted range's copy)
-            if (a < HEAP_BASE || a - HEAP_BASE >= HEAP_MAX) continue;
+            if (a < HEAP_BASE || a - HEAP_BASE >= GPU_SPAN) continue;
             uint64_t off = a - HEAP_BASE;
             int k0 = (int)(off >> gc_shift), k1 = (int)((off + (sz ? sz : 1) - 1) >> gc_shift);
             for (int k = k0; k <= k1 && k < gc_n && n < GMEM_DIRECT_MAX; k++) {
@@ -4115,7 +4149,7 @@ static void gmem_chunk_bind(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeli
         if (!(stages & (1u << stage))) continue;
         for (int i = 0; i < 16; i++) {
             uint64_t a = sbufs(stage)[i].addr, sz = sbufs(stage)[i].size;  // (overlap: a snapshotted range's copy - its chunk)
-            if (a < HEAP_BASE || a - HEAP_BASE >= HEAP_MAX) continue;
+            if (a < HEAP_BASE || a - HEAP_BASE >= GPU_SPAN) continue;
             if (log_sb) {
                 static uint64_t seen[64]; static int nseen;
                 uint64_t key = a ^ (sz << 40) ^ ((uint64_t)(stage * 16 + i) << 56);
@@ -4331,8 +4365,8 @@ static bool pt_init(void) {
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
     pt_state = n >= 0 && pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
-    vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
-    vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
+    vc_page_gen = calloc(GPU_SPAN / VC_PAGE, sizeof *vc_page_gen);
+    vc_page_gpu = calloc(GPU_SPAN / VC_PAGE, 1);
     vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
     return true;
 }
@@ -4342,7 +4376,7 @@ static bool pt_init(void) {
 // *now: the generation to pass next time.
 // (gpu_unknown: pages the GPU writes answer -1 - the upload checks; the storage write watch asks about the CPU alone)
 static int pages_written(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now, bool gpu_unknown) {
-    if (!size || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX || !pt_init()) return -1;
+    if (!size || addr < HEAP_BASE || addr - HEAP_BASE + size > GPU_SPAN || !pt_init()) return -1;
     uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     static uint64_t pages[4096];
     uint64_t pg = VC_PAGE;
@@ -4366,7 +4400,7 @@ static int pages_cpu_written(uint64_t addr, uint64_t size, uint32_t since, uint3
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
     if (!pt_init()) return;
-    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < HEAP_MAX / VC_PAGE; p++) vc_page_gpu[p] = 1;
+    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < GPU_SPAN / VC_PAGE; p++) vc_page_gpu[p] = 1;
     vc_epoch++;
 }
 
@@ -4374,7 +4408,7 @@ static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
 static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = sbufs(stage)[i].addr, sz = sbufs(stage)[i].size;  // (overlap: the copy, where the shader wrote)
-        if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
+        if (a >= HEAP_BASE && sz && a - HEAP_BASE < GPU_SPAN) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
     }
 }
 
@@ -4503,7 +4537,7 @@ static bool guest_direct(int kind, uint64_t addr, uint64_t size, VkBuffer *buf, 
     bind_note(kind, addr, size);
     if (gc_lazy) {
         uint64_t o = addr - HEAP_BASE;
-        if (!size || o + size > HEAP_MAX) return false;
+        if (!size || o + size > GPU_SPAN) return false;
         int k = (int)(o >> gc_shift);
         if ((int)((o + size - 1) >> gc_shift) != k || !gmem_covers(o, size)) return false;  // (crossing chunks: copied)
         if (vcache_lookup(addr, size, buf, off)) return true;
@@ -4541,7 +4575,7 @@ void vk_exec_reset(void) {
         gmem_buf = VK_NULL_HANDLE;
         gmem_mem = VK_NULL_HANDLE;
 #ifdef __linux__
-        if (placed && !plat_reset_guest(HEAP_BASE, HEAP_BASE + HEAP_MAX)) FATAL("cannot restore the guest heap mapping\n");
+        if (placed && !plat_reset_guest(HEAP_BASE, HEAP_BASE + GPU_SPAN)) FATAL("cannot restore the guest heap mapping\n");
         gmem_dmabuf = false;  // (the next boot decides again)
 #endif
     }
@@ -4559,7 +4593,7 @@ void vk_exec_reset(void) {
     vc_npend = 0;
     vc_free_dead(true);
     vc_bytes = 0;
-    if (vc_page_gpu) memset(vc_page_gpu, 0, HEAP_MAX / VC_PAGE);
+    if (vc_page_gpu) memset(vc_page_gpu, 0, GPU_SPAN / VC_PAGE);
     vc_epoch++;
     snap_reset();  // (overlap: the storage copies' ring follows the heap, decided again once it is set up)
     st_defaults();
@@ -4837,7 +4871,7 @@ static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3]) {
 
 static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint64_t addr) {
     maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_size = GPU_SPAN;
     maxwell_gmem_chunk_shift = gmem_chunk_shift();
     ShaderKey k = {0};
     k.glsl = 1;
@@ -5319,10 +5353,16 @@ static void prep_check(const PipeKey *k, uint64_t vh, uint64_t fh, const ShaderR
 }
 
 static void draw_(CmdRec *r, bool indexed);
+static void linear_drawn_note(NvnTexture *t);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
+    g_draw_must_run = false;
     PROF_ADD(prof_draw);
+}
+// (g_draw_must_run) a program or pipeline queued by an earlier draw that is still building: waited for
+static void wait_built(_Atomic int *state) {
+    while (atomic_load(state) == 0) { struct timespec ts = {0, 200000}; nanosleep(&ts, NULL); }
 }
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
@@ -5334,8 +5374,18 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    {
+        extern bool renderer_texture_drawn_lately(NvnTexture *t);
+        NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+        g_draw_must_run = t0 && (t0->target == 2 || !renderer_texture_drawn_lately(t0));
+    }
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    if (pr && g_draw_must_run) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(!pr ? SK_NO_STAGES : atomic_load(&pr->state) == 2 ? SK_PROG_FAILED : SK_PROG_BUILDING); return; }
+    {
+        extern void renderer_texture_note_drawn(NvnTexture *t);
+        for (int i = 0; i < st.rt.ncolor; i++) { renderer_texture_note_drawn(st.rt.color[i]); linear_drawn_note(st.rt.color[i]); }
+    }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
         extern bool mirror_draw(bool composite);
@@ -5418,7 +5468,8 @@ static void draw_(CmdRec *r, bool indexed) {
     PipeKey k;
     VtxLayout vl;  // the draw's vertex layout (on a memo hit: the memo's, made from the same inputs)
     Pipe *pp;
-    if (pm && pm->pp && pm->gen == key_gen && pm->ncolor == pass_ncolor && pm->samples == pass_samples && pm->depth == pass_depth &&
+    const uint8_t depth_only = (st.bound_stages & 1) && !(st.bound_stages & 2);
+    if (pm && pm->pp && pm->gen == key_gen && pm->depth_only == depth_only && pm->ncolor == pass_ncolor && pm->samples == pass_samples && pm->depth == pass_depth &&
         pm->stencil == pass_stencil && pm->nattrib == st.nattrib && pm->nstream == st.nstream && pm->channel_mask == in.channel_mask &&
         pm->blend_on == in.blend_on && pm->a2c == in.a2c && pm->cls == in.topo_class && pm->poly_fill == in.poly_fill &&
         !memcmp(pm->color, pass_color, npc * sizeof pass_color[0]) && !memcmp(pm->rt_fmt, rt_fmt, sizeof rt_fmt) &&
@@ -5429,6 +5480,7 @@ static void draw_(CmdRec *r, bool indexed) {
         vl = pm->vl;  // (the key leaves the layout out with dynamic vertex input: kept with the memo)
     } else {
         pipe_key_fill(&k, pr, &in, pass_color, pass_ncolor, pass_depth, pass_stencil, pass_samples, &vl);
+        k.depth_only = depth_only;
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
         uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
@@ -5460,7 +5512,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (pm) {
             pm->gen = key_gen; pm->ncolor = pass_ncolor; pm->samples = pass_samples; pm->depth = pass_depth; pm->stencil = pass_stencil;
             pm->nattrib = st.nattrib; pm->nstream = st.nstream; pm->channel_mask = in.channel_mask; pm->blend_on = in.blend_on;
-            pm->a2c = in.a2c; pm->cls = in.topo_class; pm->poly_fill = in.poly_fill;
+            pm->a2c = in.a2c; pm->cls = in.topo_class; pm->poly_fill = in.poly_fill; pm->depth_only = depth_only;
             memcpy(pm->color, pass_color, sizeof pm->color); memcpy(pm->rt_fmt, rt_fmt, sizeof pm->rt_fmt);
             memcpy(pm->attrib, st.attrib, sizeof pm->attrib); memcpy(pm->stream, st.stream, sizeof pm->stream);
             memcpy(pm->blend, st.blend, sizeof pm->blend);
@@ -5470,6 +5522,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     {   // a pipeline still building: the draw is skipped (as on Metal), unless the recorder waits for it at the bind
         // (LARECOMP_VK_RECORDER_WAIT_PIPES=1, record.c: pipe_resolve); one that failed is always skipped
+        if (g_draw_must_run) wait_built(&pp->state);
         int ps = atomic_load(&pp->state);
         if (ps == 2) { SKIP(SK_PIPE_FAILED); return; }
         if (ps != 1 && !rec_wait_pipes()) { SKIP(SK_PIPE_BUILDING); return; }
@@ -5944,7 +5997,24 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
-static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
+// (batch: the readback is left pending - copy_pending_finish copies it to guest memory after one flush for them all)
+typedef struct { void *dst; const void *src; uint64_t n; VkImage img; VmaAllocation mem; } PendingCopy;
+static PendingCopy pending_copies[16];
+static int npending_copies;
+static void copy_pending_finish(void) {
+    if (!npending_copies) return;
+    wait_why = "linear target write-back";
+    renderer_flush();
+    for (int i = 0; i < npending_copies; i++) {
+        PendingCopy *p = &pending_copies[i];
+        memcpy(p->dst, p->src, p->n);
+        if (p->mem) vmaDestroyImage(g_vk.vma, p->img, p->mem);
+    }
+    npending_copies = 0;
+}
+static void copy_texture_to_buffer_(const TexRefRec *src, uint64_t dst, bool batch);
+static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) { copy_texture_to_buffer_(src, dst, false); }
+static void copy_texture_to_buffer_(const TexRefRec *src, uint64_t dst, bool batch) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     t = alias_read(t);
@@ -5986,10 +6056,44 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
     rec_CmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    if (batch && npending_copies < 16) {
+        pending_copies[npending_copies++] = (PendingCopy){(void *)(uintptr_t)dst, out.ptr, total, srcimg, small_mem};
+        return;
+    }
     wait_why = "texture -> buffer readback";
     renderer_flush();  // the CPU may read the result right after the fence
     memcpy((void *)(uintptr_t)dst, out.ptr, total);
     if (small_mem) vmaDestroyImage(g_vk.vma, srcimg, small_mem);
+}
+
+// Linear render targets (NVN_TEX_LINEAR 0x40: ACNH's camera renders its photo into one, then hands that memory to
+// caps:su) drawn or copied into: written back to guest memory at the next fence in the list or at the list's end
+// (renderer.m's rule). Vulkan's images aren't the guest's memory, so each write-back is a readback; targets drawn
+// every frame keep the readback of the frame (one flush for all of them), as one-shot ones do.
+#define LINEAR_DRAWN_MAX 16
+static NvnTexture *linear_drawn[LINEAR_DRAWN_MAX];
+static int nlinear_drawn;
+static void linear_drawn_note(NvnTexture *t) {
+    if (!t || !(t->flags & 0x40) || t->target != 1 || t->addr < HEAP_BASE) return;
+    for (int i = 0; i < nlinear_drawn; i++) if (linear_drawn[i] == t) return;
+    if (nlinear_drawn < LINEAR_DRAWN_MAX) linear_drawn[nlinear_drawn++] = t;
+}
+void vk_linear_drawn_forget(NvnTexture *t) {  // (textures.c: the texture is destroyed)
+    for (int i = 0; i < nlinear_drawn; i++)
+        if (linear_drawn[i] == t) { linear_drawn[i] = linear_drawn[--nlinear_drawn]; return; }
+}
+static void linear_drawn_write_back(void) {
+    if (!nlinear_drawn) return;
+    uint64_t row = st.copy_row_stride, img = st.copy_image_stride;
+    st.copy_row_stride = st.copy_image_stride = 0;  // (packed rows: NVN_TEX_LINEAR's layout)
+    for (int i = 0; i < nlinear_drawn; i++) {
+        NvnTexture *t = linear_drawn[i];
+        TexRefRec whole = {.tex = (uint64_t)(uintptr_t)t};
+        copy_texture_to_buffer_(&whole, t->addr, true);
+    }
+    nlinear_drawn = 0;
+    st.copy_row_stride = row, st.copy_image_stride = img;
+    copy_pending_finish();
 }
 
 // Scaled depth copies (the game's depth pyramid) are blits, but a depth format needn't support being a blit destination:
@@ -6727,17 +6831,40 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 
 // ================================================================== executor (renderer.m exec_list)
 static void exec_list(uint64_t handle, int depth) {
-    uint64_t p = handle;
+    uint64_t p = handle, prev = 0;
     for (int guard = 0; guard < 10000000; guard++) {
+        if (p < 0x100000) {  // (a broken list: a jump or call to nowhere)
+            static int nlog;
+            if (nlog++ < 8) LOG("[vk] command list %#llx: record at %#llx (after %#llx, op %u) - stopped\n",
+                                (unsigned long long)handle, (unsigned long long)p, (unsigned long long)prev,
+                                prev ? ((CmdRec *)(uintptr_t)prev)->op : 0);
+            return;
+        }
         CmdRec *r = (CmdRec *)(uintptr_t)p;
+        prev = p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        if (st.render_off && (r->op == CMD_CLEAR_COLOR || r->op == CMD_CLEAR_DEPTH_STENCIL || r->op == CMD_CLEAR_TEXTURE ||
+                              r->op == CMD_DRAW_ARRAYS || r->op == CMD_DRAW_ELEMENTS || r->op == CMD_DRAW_ARRAYS_INDIRECT ||
+                              r->op == CMD_DRAW_ELEMENTS_INDIRECT)) {
+            p += r->size;
+            continue;
+        }
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;
-            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
+            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) {
+                if (h[i] < 0x100000) {
+                    static int nlog;
+                    if (nlog++ < 8) LOG("[vk] command list %#llx calls %llu lists, #%llu is %#llx: skipped\n",
+                                        (unsigned long long)handle, (unsigned long long)r->x[0], (unsigned long long)i,
+                                        (unsigned long long)h[i]);
+                    continue;
+                }
+                exec_list(h[i], depth + 1);
+            }
             break;
         }
         case CMD_BIND_PROGRAM:
@@ -6820,6 +6947,19 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
+        case CMD_SET_RENDER_ENABLE: st.render_off = !r->x[0]; break;
+        case CMD_SET_RENDER_ENABLE_CONDITIONAL: {
+            // (mode x0: 0 render if equal, 1 if not; x1: two 16-byte counter reports, compared by their counter.
+            // agl's lazy clears: armed once, then the counter report after the first clear turns the ones that follow
+            // off for good - renderer.m)
+            const uint64_t *c = r->x[1] >= GUEST_LO && r->x[1] < GUEST_HI ? (const uint64_t *)(uintptr_t)r->x[1] : NULL;
+            st.render_off = c && ((c[0] == c[2]) != (r->x[0] == 0));
+            static int log_cond = -1;
+            if (log_cond < 0) log_cond = getenv("LARECOMP_LOG_COND") ? 200 : 0;
+            if (log_cond > 0 && c) log_cond--, LOG("[cond] mode %llu at %#llx: %#llx (%#llx) vs %#llx (%#llx) -> %s\n", r->x[0], r->x[1],
+                                                  c[0], c[1], c[2], c[3], st.render_off ? "off" : "on");
+            break;
+        }
         case CMD_CLEAR_COLOR: {
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
@@ -6895,6 +7035,7 @@ static void exec_list(uint64_t handle, int depth) {
             guest_copy_flush();  // (cbuf copies shared within the submission are stale now)
             break;
         case CMD_FENCE_SYNC: {
+            linear_drawn_write_back();
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
@@ -6914,6 +7055,7 @@ static void exec_list(uint64_t handle, int depth) {
             extern uint64_t vk_frame_counter(void);
             if (mode == 1 && vk_frame_counter() != frame_seen) { frame_seen = vk_frame_counter(); frame_ts = ns_to_gpu_ticks(plat_now_ns()); }
             if (!out) break;
+            guest_copy_flush();  // (it writes guest memory a shared cbuf copy may hold)
             out[0] = 0;
             out[1] = mode == 1 ? frame_ts : mode == 3 ? SDL_GetTicksNS() : ns_to_gpu_ticks(plat_now_ns());  // (3 legacy: ns, the old bug)
             static uint64_t *prev_out;  // (frame pacing: the pair's start)
@@ -6943,7 +7085,12 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
+        case CMD_COPY_TEXTURE_TO_TEXTURE: {
+            const TexRefRec *t = x;
+            copy_texture(&t[0], &t[1], r->x[6]);
+            linear_drawn_note((NvnTexture *)(uintptr_t)t[1].tex);
+            break;
+        }
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
@@ -6955,6 +7102,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         case CMD_REPORT_VALUE:
             if (r->x[1] >= GUEST_LO && r->x[1] < GUEST_HI) *(volatile uint32_t *)(uintptr_t)r->x[1] = (uint32_t)r->x[0];
+            guest_copy_flush();
             break;
         case CMD_COPY_BUFFER_TO_BUFFER:
             wait_why = "buffer -> buffer copy";
@@ -6970,6 +7118,7 @@ static void exec_list(uint64_t handle, int depth) {
 void backend_execute(uint64_t handle) {
     PROF_T0();
     exec_list(handle, 0);
+    linear_drawn_write_back();
     PROF_ADD(prof_exec);
     if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
     static int sync_submit = -1;
