@@ -20,7 +20,8 @@ works on macOS and iOS / iPadOS for now (the code is portable; other platforms n
 - **Played offline on two devices?** The newest save wins when each one starts. The other is in that device's file in
   the bucket, and in the backups of any device it was replaced on: nothing is deleted. The menu's Saves tab also lists
   every device's save, with *Use this save* to take one (it downloads it, backs up the save here and restarts the game).
-- Restoring an ordinary backup makes it the newest save: it's uploaded, and the other devices take it when they start.
+- Restoring a backup, or picking another device's save, makes it the newest save: it's uploaded as this device's
+  save at the next start, and the other devices take it when they start.
 
 ## Setting it up with Backblaze B2
 
